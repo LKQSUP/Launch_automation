@@ -1,0 +1,25 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+
+# Environments
+env/
+venv/
+ENV/
+
+# VSCode
+.vscode/
+
+# Deployment / local files
+.env
+.env.*
+lkq_remote_support.db
+
+# Reports and caches
+reports/*.cache
