@@ -1,0 +1,4 @@
+Opening scan workflow
+Looking for Health Report or Report action
+Waiting for scan completion indicators
+Attempting to export or save the report

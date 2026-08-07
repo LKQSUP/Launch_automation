@@ -1,0 +1,14 @@
+{
+    "python-envs.defaultEnvManager": "ms-python.python:system",
+    "chat.tools.terminal.autoApprove": {
+        "/^python -m py_compile c:\\\\Users\\\\lkqse\\\\Desktop\\\\LKQ_dev\\\\Launch_automation\\\\modules\\\\adb_controller\\.py$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "adb": true,
+        "/^streamlit run main\\.py --server\\.port 8502 --server\\.address 127\\.0\\.0\\.1$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
+}

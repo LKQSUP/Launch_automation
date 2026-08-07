@@ -1,0 +1,6 @@
+streamlit>=1.25
+pandas>=2.0
+adbutils>=0.4.0
+openai>=1.0
+langchain>=0.1.0
+python-dotenv>=1.0
