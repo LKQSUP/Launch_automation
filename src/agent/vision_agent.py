@@ -57,20 +57,33 @@ def _run_adb(args: List[str], timeout: int = 15, binary: bool = False) -> subpro
 def _read_db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.execute(
-        "CREATE TABLE IF NOT EXISTS vision_agent_steps (id INTEGER PRIMARY KEY AUTOINCREMENT, serial TEXT, goal TEXT, action TEXT, detail TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
+        "CREATE TABLE IF NOT EXISTS vision_agent_steps (id INTEGER PRIMARY KEY AUTOINCREMENT, serial TEXT, device_label TEXT, goal TEXT, action TEXT, detail TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
     )
     conn.execute(
-        "CREATE TABLE IF NOT EXISTS vision_agent_memory (id INTEGER PRIMARY KEY AUTOINCREMENT, serial TEXT, goal TEXT, action TEXT, success INTEGER, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
+        "CREATE TABLE IF NOT EXISTS vision_agent_memory (id INTEGER PRIMARY KEY AUTOINCREMENT, serial TEXT, device_label TEXT, goal TEXT, action TEXT, success INTEGER, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
     )
+    for table in ("vision_agent_steps", "vision_agent_memory"):
+        cols = [row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+        if "device_label" not in cols:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN device_label TEXT")
     return conn
+
+
+def _label_for(serial: str) -> str:
+    try:
+        from modules.adb_controller import get_device_label
+
+        return get_device_label(serial) or serial
+    except Exception:
+        return serial or ""
 
 
 def record_step(serial: str, goal: str, action: str, detail: str) -> None:
     conn = _read_db()
     try:
         conn.execute(
-            "INSERT INTO vision_agent_steps (serial, goal, action, detail) VALUES (?, ?, ?, ?)",
-            (serial, goal, action, detail),
+            "INSERT INTO vision_agent_steps (serial, device_label, goal, action, detail) VALUES (?, ?, ?, ?, ?)",
+            (serial, _label_for(serial), goal, action, detail),
         )
         conn.commit()
     finally:
@@ -81,8 +94,8 @@ def record_memory(serial: str, goal: str, action: str, success: bool) -> None:
     conn = _read_db()
     try:
         conn.execute(
-            "INSERT INTO vision_agent_memory (serial, goal, action, success) VALUES (?, ?, ?, ?)",
-            (serial, goal, action, int(success)),
+            "INSERT INTO vision_agent_memory (serial, device_label, goal, action, success) VALUES (?, ?, ?, ?, ?)",
+            (serial, _label_for(serial), goal, action, int(success)),
         )
         conn.commit()
     finally:

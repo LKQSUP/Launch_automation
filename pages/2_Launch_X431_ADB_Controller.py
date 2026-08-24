@@ -1,217 +1,767 @@
+"""Launch X431 — auto detection + VIN audit (multi-brand platform; VAG workflows first).
+
+Flow: Sync → choose brand → Intelligent Diagnose → wait processing →
+AutoDetect Result → read VIN/Make → save for audit.
+"""
+
+from __future__ import annotations
+
+import threading
+import time
+
 import streamlit as st
+
 from modules.adb_controller import (
-    execute_dtc_clear_sequence,
-    execute_dtc_scan_and_report,
-    execute_full_car_identification,
-    execute_service_reset,
-    get_device_info,
-    get_device_state,
+    connect_adb_wifi,
+    connection_mode,
+    disconnect_adb_wifi,
+    get_device_label,
+    get_device_wifi_ip,
+    hard_reset_x431_session,
+    is_wifi_serial,
+    launch_x431,
     list_devices,
-    perform_action,
+    set_device_alias,
+    switch_usb_to_wifi,
     sync_adb_devices,
 )
-from src.agent.vision_agent import VisionAgent
+from modules.brand_catalog import (
+    brand_group_names,
+    brands_in_group,
+    has_fca_oil_reset,
+    has_full_workflow,
+    has_renault_auto_search,
+)
+from modules.db import fetch_vin_audit
+from modules.fca_workflows import FCAWorkflowEngine
+from modules.vag_workflows import VAGWorkflowEngine
 
-st.set_page_config(page_title="Launch X431 ADB Controller", layout="wide")
-st.title("Launch X431 ADB Controller")
-
-st.markdown(
-    "Control and manage a connected Launch tablet to open X431 Euro Link, inspect the UI, and run state-driven diagnostic workflows."
+st.set_page_config(page_title="Launch X431 — Auto Detect", layout="wide")
+st.title("Launch X431 — Auto detection + VIN audit")
+st.caption(
+    "Multi-brand platform: all groups use **Intelligent Diagnose** first. "
+    "VAG: full scan + report email. Renault/Dacia: Automatically Search + model pick. "
+    "FCA (Fiat/Jeep/…): **Oil Maintenance Reset** (SGW). "
+    "Sync ADB (USB or Wi-Fi), leave the tablet on EURO LINK home before starting."
 )
 
-if "last_adb_devices" not in st.session_state:
-    st.session_state["last_adb_devices"] = list_devices()
 
-col_sync, col_select = st.columns([1, 4])
-with col_sync:
-    if st.button("Sync ADB devices"):
-        status_area = st.empty()
-        raw_area = st.empty()
-        with st.spinner("Looking for ADB devices..."):
-            result = sync_adb_devices()
-        for s in result.get("steps", []):
-            status_area.write(s)
-        if result.get("ok") and result.get("devices"):
-            st.success(f"ADB sync successful — found {len(result['devices'])} device(s)")
-            st.session_state["last_adb_devices"] = result["devices"]
+def _format_adb_device(serial: str) -> str:
+    label = get_device_label(serial)
+    mode = "Wi-Fi" if is_wifi_serial(serial) else "USB"
+    if label != serial:
+        return f"{label} ({mode})"
+    return f"{serial} ({mode})"
+
+
+devices = list_devices() if not (st.session_state.get("autodetect_ctl") or {}).get("running") else (
+    st.session_state.get("last_adb_devices") or []
+)
+if devices or "last_adb_devices" not in st.session_state:
+    st.session_state["last_adb_devices"] = devices or st.session_state.get("last_adb_devices", [])
+
+# --- 1) Sync --------------------------------------------------------------------
+st.subheader("1. Sync tablet")
+c_sync, c_dev = st.columns([1, 3])
+with c_sync:
+    if st.button("Sync ADB", type="primary", use_container_width=True):
+        result = sync_adb_devices()
+        st.session_state["last_adb_devices"] = result.get("devices") or []
+        if result.get("devices"):
+            st.success(f"Found {len(result['devices'])} device(s)")
         else:
-            st.error("ADB sync completed: no devices found or error occurred")
-        raw_area.code(result.get("raw", ""))
+            st.error("No ADB device found")
+        if result.get("raw"):
+            st.code(result["raw"])
 
-with col_select:
-    device_serial = st.selectbox("Select ADB device", ["<none>"] + st.session_state.get("last_adb_devices", []))
+with c_dev:
+    options = st.session_state.get("last_adb_devices") or []
+    if not options:
+        st.info("No device yet — plug USB and Sync, or use Wi-Fi connect below.")
+        serial = ""
+    else:
+        serial = st.selectbox(
+            "ADB device",
+            options,
+            index=0,
+            format_func=_format_adb_device,
+        )
+        label = get_device_label(serial)
+        mode = connection_mode(serial)
+        st.write(f"Selected: `{label}` · **{mode.upper()}**")
+        if label != serial:
+            st.caption(f"Serial: `{serial}`")
 
-if device_serial and device_serial != "<none>":
-    st.markdown("---")
-    st.subheader("Device Information")
+        # Keep widget key in sync before the text_input is created (Streamlit rule).
+        st.session_state["adb_label_serial"] = serial
+        if st.session_state.get("adb_label_for_serial") != serial:
+            st.session_state["adb_device_label"] = label
+            st.session_state["adb_label_for_serial"] = serial
 
-    state = get_device_state(device_serial)
-    col1, col2 = st.columns(2)
-    with col1:
-        st.write(f"**Serial:** {device_serial}")
-        st.write(f"**Connected:** {state.get('connected')}")
-    with col2:
-        st.write(f"**Product:** {state.get('product', 'Unknown')}")
+        def _save_adb_device_label() -> None:
+            target = st.session_state.get("adb_label_serial") or ""
+            raw = (st.session_state.get("adb_device_label") or "").strip() or "Launch_Osias"
+            saved = set_device_alias(target, raw)
+            st.session_state["adb_device_label"] = saved
+            st.session_state["adb_label_for_serial"] = target
+            st.session_state["adb_label_just_saved"] = saved
 
-    with st.spinner("Fetching device details..."):
-        try:
-            dev_info = get_device_info(device_serial)
-            if "error" in dev_info:
-                st.warning(f"Could not fetch full device info: {dev_info['error']}")
-            else:
-                st.write(f"**Model:** {dev_info.get('model', 'N/A')}")
-                st.write(f"**Android Version:** {dev_info.get('android_version', 'N/A')}")
-                st.write(f"**Build:** {dev_info.get('build_fingerprint', 'N/A')}")
-        except Exception as exc:
-            st.error(f"Error fetching device info: {exc}")
+        st.text_input("Device label", key="adb_device_label")
+        st.button(
+            "Save label",
+            on_click=_save_adb_device_label,
+            use_container_width=True,
+        )
+        if saved_label := st.session_state.pop("adb_label_just_saved", None):
+            st.success(f"Saved label: `{saved_label}`")
 
-    st.markdown("---")
-    st.subheader("Workflow Automation")
+# --- 1b) Wi-Fi (same network) -------------------------------------------------
+st.markdown("##### Wi-Fi connection (same network, no USB)")
+st.caption(
+    "PC and tablet must be on the same LAN. First time: connect USB once, then "
+    "**Switch USB → Wi-Fi**. Later: enter the tablet IP and **Connect Wi-Fi** "
+    "(re-enable with USB after a tablet reboot)."
+)
 
-    workflow_col1, workflow_col2, workflow_col3, workflow_col4 = st.columns(4)
-    with workflow_col1:
-        if st.button("Run Full Auto-Scan & Clear"):
-            with st.spinner("Running the full workflow..."):
-                logs = []
-                status = st.status("Running workflow")
-                progress_bar = st.progress(0.0)
+# Apply pending IP before the text_input widget is created (Streamlit rule).
+pending_wifi_host = st.session_state.pop("adb_wifi_host_pending", None)
+if pending_wifi_host:
+    st.session_state["adb_wifi_host"] = pending_wifi_host
+elif "adb_wifi_host" not in st.session_state:
+    wifi_ip_default = ""
+    if serial and not is_wifi_serial(serial):
+        wifi_ip_default = get_device_wifi_ip(serial) or ""
+    elif serial and is_wifi_serial(serial):
+        wifi_ip_default = serial.rsplit(":", 1)[0]
+    if wifi_ip_default:
+        st.session_state["adb_wifi_host"] = wifi_ip_default
 
-                def emit(message: str, progress: float | None = None):
-                    logs.append(message)
-                    status.write(message)
-                    if progress is not None:
-                        progress_bar.progress(progress)
-
-                try:
-                    execute_full_car_identification(device_serial, callback=emit)
-                    execute_dtc_scan_and_report(device_serial, callback=emit)
-                    execute_dtc_clear_sequence(device_serial, callback=emit)
-                    status.update(label="Workflow completed", state="complete", expanded=False)
-                    progress_bar.progress(1.0)
-                except Exception as exc:
-                    status.update(label="Workflow failed", state="error", expanded=False)
-                    logs.append(f"ERROR: {exc}")
-                st.text_area("Execution log", "\n".join(logs), height=220)
-
-    with workflow_col2:
-        if st.button("Execute Oil Reset"):
-            logs = []
-            status = st.status("Executing Oil Reset")
-            progress_bar = st.progress(0.0)
-
-            def emit(message: str, progress: float | None = None):
-                logs.append(message)
-                status.write(message)
-                if progress is not None:
-                    progress_bar.progress(progress)
-
-            try:
-                execute_service_reset(device_serial, "Oil Reset", callback=emit)
-                status.update(label="Oil Reset completed", state="complete", expanded=False)
-                progress_bar.progress(1.0)
-            except Exception as exc:
-                status.update(label="Oil Reset failed", state="error", expanded=False)
-                logs.append(f"ERROR: {exc}")
-            st.text_area("Execution log", "\n".join(logs), height=220)
-
-    with workflow_col3:
-        if st.button("Export PDF Report"):
-            logs = []
-            status = st.status("Exporting report")
-            progress_bar = st.progress(0.0)
-
-            def emit(message: str, progress: float | None = None):
-                logs.append(message)
-                status.write(message)
-                if progress is not None:
-                    progress_bar.progress(progress)
-
-            try:
-                execute_dtc_scan_and_report(device_serial, callback=emit)
-                status.update(label="Report export completed", state="complete", expanded=False)
-                progress_bar.progress(1.0)
-            except Exception as exc:
-                status.update(label="Report export failed", state="error", expanded=False)
-                logs.append(f"ERROR: {exc}")
-            st.text_area("Execution log", "\n".join(logs), height=220)
-
-    with workflow_col4:
-        if st.button("Launch X431"):
-            with st.spinner("Launching X431 Euro Link..."):
-                try:
-                    result = perform_action(device_serial, "launch_x431")
-                    st.success("X431 Euro Link app launched")
-                    st.code(result)
-                except Exception as exc:
-                    st.error(f"Failed to launch X431: {exc}")
-
-    st.markdown("---")
-    st.subheader("Vision Agent")
-    vision_prompt = st.text_area(
-        "Vision Agent Prompt",
-        value="Run the full pre-scan and look for clear fault memory actions.",
-        height=100,
+w1, w2, w3, w4 = st.columns([2, 1, 1, 1])
+with w1:
+    wifi_host = st.text_input(
+        "Tablet IP (or IP:5555)",
+        key="adb_wifi_host",
+        placeholder="192.168.1.50",
+        help="Tablet Settings → About / Wi-Fi status, or auto-filled from USB.",
     )
-    if st.button("Run Vision Agent"):
-        if not vision_prompt.strip():
-            st.warning("Please enter a goal for the vision agent.")
-        else:
-            logs = []
-            status_area = st.empty()
-            log_area = st.empty()
+with w2:
+    do_switch = st.button(
+        "Switch USB → Wi-Fi",
+        use_container_width=True,
+        disabled=not serial or is_wifi_serial(serial),
+        help="Uses the selected USB device: enable TCP/IP, then connect over Wi-Fi.",
+    )
+with w3:
+    do_wifi_connect = st.button("Connect Wi-Fi", type="primary", use_container_width=True)
+with w4:
+    do_wifi_disconnect = st.button("Disconnect Wi-Fi", use_container_width=True)
 
-            def emit(message: str) -> None:
-                logs.append(message)
-                status_area.info(message)
-                log_area.text("\n".join(logs))
+if do_switch and serial:
+    with st.spinner("Switching selected USB tablet to Wi-Fi ADB…"):
+        result = switch_usb_to_wifi(serial)
+    st.session_state["last_adb_devices"] = result.get("devices") or list_devices()
+    if result.get("ip"):
+        st.session_state["adb_wifi_host_pending"] = result["ip"]
+    if result.get("ok"):
+        st.session_state["adb_wifi_flash"] = (
+            "success",
+            f"Wi-Fi connected: `{result.get('endpoint')}` — USB can be unplugged",
+        )
+    else:
+        st.session_state["adb_wifi_flash"] = (
+            "error",
+            "USB → Wi-Fi switch failed\n" + "\n".join(result.get("steps") or []),
+        )
+    st.rerun()
 
-            try:
-                status_area.info("Starting vision agent...")
-                agent = VisionAgent(device_serial, vision_prompt, callback=emit)
-                steps = agent.run()
-                status_area.success("Vision agent completed")
-                log_area.text("\n".join(logs) if logs else "No logs generated.")
-                st.markdown("**Vision Agent Actions**")
-                for step in steps:
-                    st.write(f"{step['attempt']}: **{step['action']}** -> {step.get('target', '')} — {step.get('reason', '')}")
-            except Exception as exc:
-                status_area.error("Vision agent failed")
-                st.error(f"Vision agent failed: {exc}")
+# Show flash from previous Wi-Fi action (after rerun).
+flash = st.session_state.pop("adb_wifi_flash", None)
+if flash:
+    level, message = flash
+    if level == "success":
+        st.success(message)
+    else:
+        st.error(message.split("\n", 1)[0])
+        if "\n" in message:
+            st.code(message.split("\n", 1)[1])
 
-    st.markdown("---")
-    st.subheader("Manual Actions")
-    manual_col1, manual_col2, manual_col3 = st.columns(3)
-    with manual_col1:
-        if st.button("Auto-VIN Scan"):
-            with st.spinner("Triggering Auto-VIN scan..."):
-                try:
-                    result = perform_action(device_serial, "auto_vin")
-                    st.success("Auto-VIN scan triggered")
-                    st.code(result)
-                except Exception as exc:
-                    st.error(f"Failed to trigger Auto-VIN: {exc}")
-    with manual_col2:
-        if st.button("System Scan"):
-            with st.spinner("Starting system diagnostic scan..."):
-                try:
-                    result = perform_action(device_serial, "system_scan")
-                    st.success("System scan initiated")
-                    st.code(result)
-                except Exception as exc:
-                    st.error(f"Failed to start system scan: {exc}")
-    with manual_col3:
-        if st.button("Clear Memory"):
-            with st.spinner("Clearing diagnostic memory..."):
-                try:
-                    result = perform_action(device_serial, "clear_memory")
-                    st.success("Clear memory command sent")
-                    st.code(result)
-                except Exception as exc:
-                    st.error(f"Failed to clear memory: {exc}")
+if do_wifi_connect:
+    with st.spinner("Connecting over Wi-Fi…"):
+        result = connect_adb_wifi(wifi_host or "")
+    st.session_state["last_adb_devices"] = result.get("devices") or list_devices()
+    if result.get("ok"):
+        endpoint = result.get("endpoint") or ""
+        if endpoint:
+            st.session_state["adb_wifi_host_pending"] = endpoint.rsplit(":", 1)[0]
+        st.session_state["adb_wifi_flash"] = ("success", f"Connected: `{endpoint}`")
+    else:
+        st.session_state["adb_wifi_flash"] = (
+            "error",
+            "Wi-Fi connect failed — check IP, same network, and that TCP/IP ADB is enabled\n"
+            + "\n".join(result.get("steps") or []),
+        )
+    st.rerun()
+
+if do_wifi_disconnect:
+    target = None
+    if serial and is_wifi_serial(serial):
+        target = serial
+    elif wifi_host:
+        target = wifi_host
+    result = disconnect_adb_wifi(target)
+    st.session_state["last_adb_devices"] = result.get("devices") or list_devices()
+    if result.get("ok"):
+        st.session_state["adb_wifi_flash"] = ("success", "Wi-Fi ADB disconnected")
+    else:
+        st.session_state["adb_wifi_flash"] = (
+            "error",
+            "Disconnect finished with warnings\n" + "\n".join(result.get("steps") or []),
+        )
+    st.rerun()
+
+# Workflows need a selected device
+if not serial:
+    options = st.session_state.get("last_adb_devices") or []
+    if not options:
+        st.warning("Connect a Launch tablet via USB or Wi-Fi first.")
+        st.stop()
+    serial = options[0]
+
+# --- 2) Brand -------------------------------------------------------------------
+st.subheader("2. Choose brand")
+brand_col1, brand_col2 = st.columns(2)
+with brand_col1:
+    group = st.selectbox(
+        "Brand group",
+        brand_group_names(),
+        index=0,
+        help="Manufacturer family on EURO LINK. VAG has the full workflow today; others use the same Intelligent Diagnose first step.",
+    )
+with brand_col2:
+    group_brands = list(brands_in_group(group))
+    default_brand = st.session_state.get("selected_brand")
+    if default_brand not in group_brands:
+        default_brand = group_brands[0] if group_brands else "Volkswagen"
+    brand = st.selectbox(
+        "Brand",
+        group_brands,
+        index=group_brands.index(default_brand) if default_brand in group_brands else 0,
+    )
+st.session_state["selected_brand"] = brand
+st.session_state["vag_brand"] = brand  # legacy key
+
+if has_full_workflow(brand):
+    st.success(
+        f"**{brand}** — full VAG workflow: AutoDetect → Diagnostic → Topology scan → "
+        "Report → email to hotline.support@lkqbelgium.be."
+    )
+elif has_renault_auto_search(brand):
+    st.success(
+        f"**{brand}** — AutoDetect → Diagnostic, **or Local Diagnose search** if AutoDetect is skipped → "
+        "**Automatically Search** → YES → YES → tap identified model → System and Function → "
+        "**High-speed Scan** (or **Smart Detection**) → report email."
+    )
+elif has_fca_oil_reset(brand):
+    st.success(
+        f"**{brand}** — FCA oil reset: Intelligent Diagnose → Diagnostic → OK (SGW) → "
+        "Common Special Function → Oil Maintenance Reset → home."
+    )
 else:
-    st.warning("No connected ADB devices found. Ensure the tablet is plugged in and ADB is enabled. Click 'Sync ADB devices' to refresh.")
+    st.info(
+        f"**{brand}** — auto-detect entry enabled (Intelligent Diagnose → AutoDetect Result). "
+        "Brand-specific scan/service workflows will be added later; Local Diagnose fallback uses this brand name."
+    )
 
-st.markdown("---")
-st.info(
-    "**State-driven diagnostics:** The controller now inspects the UI hierarchy and uses text matching to navigate common Launch X431 screens instead of relying only on hard-coded taps."
+# --- 3) Start / Stop / Hard Reset ----------------------------------------------
+st.subheader("3. Start auto detection")
+st.caption(
+    "If a run is stuck: click **Stop**, then **Hard Reset** (force-stops EURO LINK and reopens home). "
+    "If the page is frozen, refresh the browser first, then Hard Reset."
 )
+
+# Thread-safe control block (mutable object held in session_state).
+if "autodetect_ctl" not in st.session_state:
+    st.session_state["autodetect_ctl"] = {
+        "running": False,
+        "cancel": threading.Event(),
+        "logs": [],  # list of {"t": iso-ish, "msg": str}
+        "progress": 0.0,
+        "outcome": None,
+        "error": None,
+        "started_at": None,
+        "brand": None,
+        "serial": None,
+        "current_step": None,
+        "step_count": 0,
+    }
+ctl = st.session_state["autodetect_ctl"]
+
+
+def _phase_from_step(message: str, progress: float) -> str:
+    """Human-readable phase label from the latest step text."""
+    low = (message or "").lower()
+    if "stopped by user" in low or "hard reset" in low:
+        return "Stopped / reset"
+    if "preflight" in low or "connecting uiautomator" in low:
+        return "1 · Connecting tablet"
+    if "home" in low or "euro link" in low and "launch" in low:
+        return "2 · Opening / confirming EURO LINK home"
+    if "intelligent diagnose" in low:
+        return "3 · Tapping Intelligent Diagnose"
+    if "select make" in low:
+        return "4 · Select Make confirmation"
+    if "processing" in low or "identification" in low or "waiting for identification" in low:
+        return "4 · Waiting for vehicle identification (VIN)"
+    if "autodetect result" in low or "vin retrieved" in low or "identity saved" in low:
+        return "5 · AutoDetect Result / VIN capture"
+    if "diagnostic" in low:
+        return "6 · Opening Diagnostic"
+    if "automatically search" in low or "renault show menu" in low:
+        return "6b · Renault Automatically Search"
+    if "system information" in low or "ignition confirm" in low:
+        return "6c · Renault YES confirm"
+    if "renault model" in low or "model identification" in low:
+        return "6d · Renault model identification"
+    if "oil" in low or "fca" in low or "common special" in low or "sgw" in low:
+        return "FCA · Oil Maintenance Reset"
+    if "tapping tablet back" in low or "back on system" in low or "inspection report after send" in low:
+        return "13 · Return to Topology"
+    if "gmail" in low or "sending report" in low or "emailed" in low:
+        return "12 · Email report via Gmail"
+    if "other share" in low or "inspection report" in low:
+        return "11 · Share inspection report"
+    if "report information" in low or "more information" in low or "tapping report" in low:
+        return "10 · Saving X431 report"
+    if "scanning ecu" in low or "scan complete" in low or "waiting for ecu scan" in low:
+        return "9 · Full ECU scan"
+    if "high-speed" in low or "smart detection" in low or "ecu scan started" in low:
+        return "8 · Starting ECU scan"
+    if "topology" in low or "system and function" in low:
+        return "7 · Waiting for System Topology"
+    if progress >= 0.95:
+        return "Done"
+    if progress <= 0.05:
+        return "Starting…"
+    return "Running…"
+
+
+def _fmt_elapsed(started_at: float | None) -> str:
+    if not started_at:
+        return "—"
+    secs = max(0, int(time.time() - float(started_at)))
+    m, s = divmod(secs, 60)
+    return f"{m:02d}:{s:02d}"
+
+
+def _log_lines(entries: list) -> list[str]:
+    lines: list[str] = []
+    for i, item in enumerate(entries or [], start=1):
+        if isinstance(item, dict):
+            ts = item.get("t") or ""
+            msg = item.get("msg") or ""
+            lines.append(f"{i:03d}  [{ts}]  {msg}")
+        else:
+            lines.append(f"{i:03d}  {item}")
+    return lines
+
+run_col, stop_col, reset_col, open_col = st.columns(4)
+with run_col:
+    start = st.button(
+        "Start auto detection",
+        type="primary",
+        use_container_width=True,
+        disabled=bool(ctl.get("running")),
+    )
+with stop_col:
+    stop = st.button(
+        "Stop",
+        use_container_width=True,
+        disabled=not bool(ctl.get("running")),
+        help="Request cancel of the current auto-detect thread.",
+    )
+with reset_col:
+    hard_reset = st.button(
+        "Hard Reset",
+        use_container_width=True,
+        help="Force-stop EURO LINK, clear stuck u2 helpers, relaunch home. Use after Stop or a frozen run.",
+    )
+with open_col:
+    if st.button("Only open EURO LINK", use_container_width=True):
+        try:
+            st.success(launch_x431(serial))
+        except Exception as exc:
+            st.error(str(exc))
+
+start_fca_oil = False
+if has_fca_oil_reset(brand):
+    start_fca_oil = st.button(
+        "Start Oil Maintenance Reset (FCA / SGW)",
+        type="primary",
+        use_container_width=True,
+        disabled=bool(ctl.get("running")),
+        help="Fiat 500e-style: Diagnostic → OK confirm → SGW OK → Common Special Function → Oil reset → home.",
+    )
+
+if stop:
+    ctl["cancel"].set()
+    st.warning("Stop requested — waiting for the current step to abort…")
+
+if hard_reset:
+    ctl["cancel"].set()
+    with st.spinner("Hard reset: force-stop EURO LINK and reopen home…"):
+        reset_result = hard_reset_x431_session(serial, relaunch=True)
+    stamp = time.strftime("%H:%M:%S")
+    step_entries = [
+        {"t": stamp, "msg": s} for s in (reset_result.get("steps") or [])
+    ]
+    ctl["running"] = False
+    ctl["logs"] = step_entries
+    ctl["progress"] = 0.0
+    ctl["outcome"] = None
+    ctl["error"] = None
+    ctl["started_at"] = time.time()
+    ctl["brand"] = brand
+    ctl["serial"] = serial
+    ctl["step_count"] = len(step_entries)
+    ctl["current_step"] = (step_entries[-1]["msg"] if step_entries else "Hard reset")
+    ctl["phase"] = "Stopped / reset"
+    ctl["cancel"] = threading.Event()  # fresh cancel flag for next run
+    if reset_result.get("ok"):
+        st.success("Hard reset done — EURO LINK should be on home. You can Start again.")
+    else:
+        st.error("Hard reset finished with errors — check the step log below.")
+
+
+def _run_autodetect_worker(serial_id: str, brand_name: str, control: dict) -> None:
+    """Background worker so Stop / Hard Reset can interrupt via cancel Event."""
+
+    def emit(message: str, progress: float | None = None) -> None:
+        stamp = time.strftime("%H:%M:%S")
+        entry = {"t": stamp, "msg": message}
+        control["logs"] = list(control.get("logs") or []) + [entry]
+        control["current_step"] = message
+        control["step_count"] = int(control.get("step_count") or 0) + 1
+        control["phase"] = _phase_from_step(message, float(control.get("progress") or 0.0))
+        if progress is not None:
+            control["progress"] = min(max(float(progress), 0.0), 1.0)
+            control["phase"] = _phase_from_step(message, control["progress"])
+
+    def cancel_check() -> bool:
+        return control["cancel"].is_set()
+
+    engine = VAGWorkflowEngine(
+        serial_id,
+        callback=emit,
+        preferred_brand=brand_name,
+        cancel_check=cancel_check,
+    )
+    try:
+        outcome = engine.start_auto_detection(brand=brand_name)
+        control["outcome"] = outcome
+        # Prefer engine.logs (plain strings) merged as final timeline if richer.
+        if engine.logs:
+            # Keep timestamped entries already emitted; only append missing tail.
+            existing = {e.get("msg") if isinstance(e, dict) else str(e) for e in (control.get("logs") or [])}
+            for msg in engine.logs:
+                if msg not in existing:
+                    emit(msg, None)
+        if outcome.get("error") and "Stopped by user" in str(outcome.get("error")):
+            control["error"] = "Stopped by user"
+            control["phase"] = "Stopped / reset"
+        elif not outcome.get("ok"):
+            control["error"] = outcome.get("error") or "Failed"
+            control["phase"] = "Failed"
+            control["current_step"] = control["error"]
+        else:
+            control["error"] = None
+            control["progress"] = 1.0
+            control["phase"] = "Done"
+            control["current_step"] = "Report emailed — back on System and Function / Topology"
+    except Exception as exc:
+        control["error"] = str(exc)
+        emit(f"ERROR: {exc}", None)
+        control["outcome"] = {"ok": False, "error": str(exc)}
+        control["phase"] = "Failed"
+    finally:
+        control["running"] = False
+
+
+def _run_fca_oil_worker(serial_id: str, brand_name: str, control: dict) -> None:
+    def emit(message: str, progress: float | None = None) -> None:
+        stamp = time.strftime("%H:%M:%S")
+        entry = {"t": stamp, "msg": message}
+        control["logs"] = list(control.get("logs") or []) + [entry]
+        control["current_step"] = message
+        control["step_count"] = int(control.get("step_count") or 0) + 1
+        control["phase"] = _phase_from_step(message, float(control.get("progress") or 0.0))
+        if progress is not None:
+            control["progress"] = min(max(float(progress), 0.0), 1.0)
+            control["phase"] = _phase_from_step(message, control["progress"])
+
+    def cancel_check() -> bool:
+        return control["cancel"].is_set()
+
+    engine = FCAWorkflowEngine(
+        serial_id,
+        callback=emit,
+        preferred_brand=brand_name,
+        cancel_check=cancel_check,
+    )
+    try:
+        outcome = engine.start_fca_oil_maintenance_reset(brand=brand_name)
+        control["outcome"] = outcome
+        if outcome.get("error") and "Stopped by user" in str(outcome.get("error")):
+            control["error"] = "Stopped by user"
+            control["phase"] = "Stopped / reset"
+        elif not outcome.get("ok"):
+            control["error"] = outcome.get("error") or "Failed"
+            control["phase"] = "Failed"
+            control["current_step"] = control["error"]
+        else:
+            control["error"] = None
+            control["progress"] = 1.0
+            control["phase"] = "Done"
+            control["current_step"] = "FCA oil reset complete — home after hard reset"
+    except Exception as exc:
+        control["error"] = str(exc)
+        emit(f"ERROR: {exc}", None)
+        control["outcome"] = {"ok": False, "error": str(exc)}
+        control["phase"] = "Failed"
+    finally:
+        control["running"] = False
+
+
+if start and not ctl.get("running"):
+    ctl["cancel"] = threading.Event()
+    ctl["running"] = True
+    ctl["logs"] = []
+    ctl["progress"] = 0.02
+    ctl["outcome"] = None
+    ctl["error"] = None
+    ctl["started_at"] = time.time()
+    ctl["brand"] = brand
+    ctl["serial"] = serial
+    ctl["current_step"] = f"Start auto detection — {brand}"
+    ctl["step_count"] = 0
+    ctl["phase"] = "Starting…"
+    # Seed first visible step
+    stamp = time.strftime("%H:%M:%S")
+    ctl["logs"] = [{"t": stamp, "msg": f"Start auto detection — {brand}"}]
+    ctl["step_count"] = 1
+    worker = threading.Thread(
+        target=_run_autodetect_worker,
+        args=(serial, brand, ctl),
+        daemon=True,
+        name="vag-autodetect",
+    )
+    worker.start()
+    st.rerun()
+
+if start_fca_oil and not ctl.get("running"):
+    ctl["cancel"] = threading.Event()
+    ctl["running"] = True
+    ctl["logs"] = []
+    ctl["progress"] = 0.02
+    ctl["outcome"] = None
+    ctl["error"] = None
+    ctl["started_at"] = time.time()
+    ctl["brand"] = brand
+    ctl["serial"] = serial
+    ctl["current_step"] = f"FCA oil reset — {brand}"
+    ctl["step_count"] = 1
+    ctl["phase"] = "FCA · Oil Maintenance Reset"
+    stamp = time.strftime("%H:%M:%S")
+    ctl["logs"] = [{"t": stamp, "msg": f"FCA oil reset — {brand}"}]
+    threading.Thread(
+        target=_run_fca_oil_worker,
+        args=(serial, brand, ctl),
+        daemon=True,
+        name="fca-oil-reset",
+    ).start()
+    st.rerun()
+
+
+def _run_topology_action_worker(serial_id: str, brand_name: str, control: dict, action: str) -> None:
+    """Report / Clear All DTCs from System and Function / Topology."""
+
+    def emit(message: str, progress: float | None = None) -> None:
+        stamp = time.strftime("%H:%M:%S")
+        entry = {"t": stamp, "msg": message}
+        control["logs"] = list(control.get("logs") or []) + [entry]
+        control["current_step"] = message
+        control["step_count"] = int(control.get("step_count") or 0) + 1
+        control["phase"] = _phase_from_step(message, float(control.get("progress") or 0.0))
+        if progress is not None:
+            control["progress"] = min(max(float(progress), 0.0), 1.0)
+            control["phase"] = _phase_from_step(message, control["progress"])
+
+    def cancel_check() -> bool:
+        return control["cancel"].is_set()
+
+    engine = VAGWorkflowEngine(
+        serial_id,
+        callback=emit,
+        preferred_brand=brand_name,
+        cancel_check=cancel_check,
+    )
+    prev = dict(control.get("outcome") or {})
+    try:
+        if action == "report":
+            outcome = engine.resend_topology_report()
+        elif action == "clear_dtcs":
+            outcome = engine.clear_all_dtcs()
+        else:
+            outcome = {"ok": False, "error": f"Unknown action: {action}"}
+        merged = {**prev, **outcome}
+        if prev.get("ok") and action == "clear_dtcs" and outcome.get("ok"):
+            merged["ok"] = True
+        control["outcome"] = merged
+        if not outcome.get("ok"):
+            control["error"] = outcome.get("error") or "Failed"
+            control["phase"] = "Failed"
+            control["current_step"] = control["error"]
+        else:
+            control["error"] = None
+            control["progress"] = 1.0
+            control["phase"] = "Done"
+            if action == "report":
+                control["current_step"] = "Report emailed — back on Topology"
+            else:
+                control["current_step"] = "Clear All DTCs done — still on Topology"
+    except Exception as exc:
+        control["error"] = str(exc)
+        emit(f"ERROR: {exc}", None)
+        control["phase"] = "Failed"
+    finally:
+        control["running"] = False
+
+
+st.markdown("#### Topology actions")
+st.caption(
+    "Use only while the tablet shows **System and Function / Topology** "
+    "(after a full scan, or after a report email). "
+    "**Report** repeats save → Gmail → Back to Topology. "
+    "**Clear All DTCs** taps the bottom-right tablet button."
+)
+act_report, act_clear = st.columns(2)
+with act_report:
+    do_report = st.button(
+        "Report",
+        use_container_width=True,
+        disabled=bool(ctl.get("running")) or not bool(serial),
+        help="Must be on System and Function / Topology. Runs Report → email → Back.",
+    )
+with act_clear:
+    do_clear = st.button(
+        "Clear All DTCs",
+        use_container_width=True,
+        disabled=bool(ctl.get("running")) or not bool(serial),
+        help="Must be on System and Function / Topology. Taps Clear All DTCs bottom-right.",
+    )
+
+
+def _start_topology_action(action: str, label: str) -> None:
+    ctl["cancel"] = threading.Event()
+    ctl["running"] = True
+    ctl["error"] = None
+    ctl["progress"] = 0.2
+    ctl["started_at"] = ctl.get("started_at") or time.time()
+    ctl["brand"] = brand
+    ctl["serial"] = serial
+    ctl["current_step"] = label
+    ctl["phase"] = label
+    stamp = time.strftime("%H:%M:%S")
+    ctl["logs"] = list(ctl.get("logs") or []) + [{"t": stamp, "msg": label}]
+    ctl["step_count"] = int(ctl.get("step_count") or 0) + 1
+    threading.Thread(
+        target=_run_topology_action_worker,
+        args=(serial, brand, ctl, action),
+        daemon=True,
+        name=f"vag-{action}",
+    ).start()
+
+
+if do_report and not ctl.get("running"):
+    _start_topology_action("report", "Report from System and Function / Topology")
+    st.rerun()
+if do_clear and not ctl.get("running"):
+    _start_topology_action("clear_dtcs", "Clear All DTCs from Topology")
+    st.rerun()
+
+# ---- Live session panel (why it's running + every step) ----
+if ctl.get("running") or ctl.get("logs") or ctl.get("outcome") is not None or ctl.get("error"):
+    st.markdown("#### Live session")
+    progress = float(ctl.get("progress") or 0.0)
+    current = ctl.get("current_step") or (ctl.get("logs") or [{}])[-1]
+    if isinstance(current, dict):
+        current = current.get("msg") or "—"
+    phase = ctl.get("phase") or _phase_from_step(str(current), progress)
+    elapsed = _fmt_elapsed(ctl.get("started_at"))
+
+    s1, s2, s3, s4 = st.columns(4)
+    if ctl.get("running"):
+        s1.metric("Status", "RUNNING")
+    elif ctl.get("error"):
+        s1.metric("Status", "FAILED / STOPPED")
+    elif ctl.get("outcome") and ctl["outcome"].get("ok"):
+        s1.metric("Status", "COMPLETE")
+    else:
+        s1.metric("Status", "IDLE")
+    s2.metric("Elapsed", elapsed)
+    s3.metric("Steps", int(ctl.get("step_count") or len(ctl.get("logs") or [])))
+    s4.metric("Brand", ctl.get("brand") or brand)
+
+    st.progress(progress)
+    st.caption(f"Progress {int(progress * 100)}% · {phase}")
+    st.info(f"**Current step:** {current}")
+    st.caption(
+        f"Phase: {phase} · Device: `{get_device_label(ctl.get('serial') or serial)}` · "
+        f"Serial: `{ctl.get('serial') or serial}`"
+    )
+
+    if ctl.get("running"):
+        st.warning("Session is active — tablet actions are in progress. Use **Stop** or **Hard Reset** if it hangs.")
+
+    with st.expander("Step-by-step log (all events)", expanded=True):
+        lines = _log_lines(ctl.get("logs") or [])
+        st.code("\n".join(lines) if lines else "(no steps yet)", language="text")
+
+    if ctl.get("running"):
+        time.sleep(0.55)
+        st.rerun()
+
+    outcome = ctl.get("outcome")
+    err = ctl.get("error")
+    if outcome and outcome.get("ok"):
+        device_name = outcome.get("device_label") or get_device_label(serial)
+        m0, m1, m2, m3, m4, m5 = st.columns(6)
+        m0.metric("Device", device_name)
+        m1.metric("VIN", outcome.get("vin") or "—")
+        m2.metric("Make", outcome.get("make") or "—")
+        m3.metric("Model", outcome.get("model") or "—")
+        m4.metric("Mode", outcome.get("diag_mode") or outcome.get("software") or "—")
+        if outcome.get("sgw") is not None and not outcome.get("emailed_to"):
+            m5.metric("SGW", "Unlocked" if outcome.get("sgw") else "—")
+            st.success(
+                f"FCA oil reset complete on `{device_name}` · VIN `{outcome.get('vin') or '—'}` · back on home"
+            )
+        else:
+            m5.metric("Email", outcome.get("emailed_to") or "—")
+            st.success(
+                f"Full scan complete on `{device_name}` · report emailed to "
+                f"`{outcome.get('emailed_to') or 'hotline.support@lkqbelgium.be'}`"
+            )
+    elif err and not ctl.get("running"):
+        st.error(err)
+
+# --- 4) Audit -------------------------------------------------------------------
+st.markdown("---")
+st.subheader("VIN audit history")
+try:
+    audit = fetch_vin_audit(limit=25)
+    if audit.empty:
+        st.info("No VIN audit rows yet — run auto detection once.")
+    else:
+        st.dataframe(audit, use_container_width=True)
+except Exception as exc:
+    st.warning(f"Could not load audit table: {exc}")

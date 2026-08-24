@@ -1,6 +1,9 @@
-streamlit>=1.25
+streamlit>=1.61.1
 pandas>=2.0
 adbutils>=0.4.0
-openai>=1.0
-langchain>=0.1.0
+uiautomator2>=3.2.0
+easyocr>=1.7.0
+opencv-python-headless>=4.8.0
+numpy>=1.24
 python-dotenv>=1.0
+torch>=2.0.0

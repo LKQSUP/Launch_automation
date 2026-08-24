@@ -1,38 +1,88 @@
-import os
-from typing import List
-from dotenv import load_dotenv
-import openai
+"""Local heuristic diagnostic advisor — no cloud AI APIs."""
 
-load_dotenv()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-if OPENAI_API_KEY:
-    openai.api_key = OPENAI_API_KEY
+from __future__ import annotations
+
+import re
+from typing import Dict, List
 
 
-def analyze_dtcs(vin: str, make: str, model: str, dtc_list: List[str]) -> dict:
-    prompt = (
-        "You are an automotive diagnostics analyst. "
-        "Evaluate the following DTCs and recommend whether it is safe to perform automated service resets or fault clearing. "
-        f"VIN: {vin}, Make: {make}, Model: {model}. "
-        f"DTCs: {', '.join(dtc_list)}. "
-        "Return a JSON object with keys: recommendation, safe_to_reset, notes."
-    )
+# Critical families where automated clear/reset is discouraged without tech review.
+CRITICAL_PREFIXES = ("P0", "P1", "P2", "C0", "C1", "U0")
+SAFE_CLEAR_HINTS = ("P05", "P06", "B00", "B10")  # often emissions/body informational
 
-    if not OPENAI_API_KEY:
-        safe = not any(code.startswith("P0") or code.startswith("C0") for code in dtc_list)
-        recommendation = "Proceed with reset" if safe else "Review with technician"
-        notes = "Mock analysis: no critical powertrain or chassis codes detected." if safe else "Mock analysis: critical codes detected, do not reset automatically."
-        return {"recommendation": recommendation, "safe_to_reset": safe, "notes": notes}
 
-    completion = openai.ChatCompletion.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": "You are an expert automotive diagnostics AI."},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.2,
-        max_tokens=260,
-    )
+def _severity(code: str) -> str:
+    code = code.upper()
+    if code.startswith(("P03", "P02", "P001", "P002")):
+        return "high"  # misfire / fuel / cam-crank
+    if code.startswith(("C00", "C10")):
+        return "high"  # chassis / ABS
+    if code.startswith(("U01", "U00")):
+        return "medium"  # network
+    if code.startswith(SAFE_CLEAR_HINTS):
+        return "low"
+    if code.startswith(CRITICAL_PREFIXES):
+        return "medium"
+    return "low"
 
-    content = completion.choices[0].message.content.strip()
-    return {"recommendation": content, "safe_to_reset": "true" in content.lower()}
+
+def analyze_dtcs(vin: str, make: str, model: str, dtc_list: List[str]) -> Dict[str, object]:
+    """Evaluate DTCs with a local rule engine and recommend safe actions.
+
+    Args:
+        vin: Vehicle identification number.
+        make: Vehicle make.
+        model: Vehicle model.
+        dtc_list: List of DTC codes (e.g. ``P0301``).
+
+    Returns:
+        Dict with ``recommendation``, ``safe_to_reset``, ``notes``, and ``details``.
+    """
+    codes = [re.sub(r"[^A-Za-z0-9]", "", c).upper() for c in dtc_list if c and c.strip()]
+    codes = [c for c in codes if re.match(r"^[PBCU][0-9A-F]{4}$", c)]
+
+    if not codes:
+        return {
+            "recommendation": "No valid DTCs provided — nothing to clear",
+            "safe_to_reset": False,
+            "notes": "Enter OBD-II style codes such as P0301, C0040, U0100.",
+            "details": [],
+        }
+
+    details = [{"code": c, "severity": _severity(c)} for c in codes]
+    high = [d for d in details if d["severity"] == "high"]
+    medium = [d for d in details if d["severity"] == "medium"]
+
+    vehicle = f"{make or ''} {model or ''}".strip() or "vehicle"
+    if high:
+        return {
+            "recommendation": "Review with technician — do not auto-clear",
+            "safe_to_reset": False,
+            "notes": (
+                f"Local heuristic flagged {len(high)} high-severity code(s) on {vehicle} "
+                f"(VIN {vin}). Investigate root cause before clearing fault memory or "
+                f"running service resets."
+            ),
+            "details": details,
+        }
+
+    if medium:
+        return {
+            "recommendation": "Conditional clear - technician acknowledgement recommended",
+            "safe_to_reset": False,
+            "notes": (
+                f"{len(medium)} medium-severity code(s) detected. Automated clear may hide "
+                f"intermittent network/powertrain faults. Prefer scan + report first."
+            ),
+            "details": details,
+        }
+
+    return {
+        "recommendation": "Proceed with automated clear / service reset",
+        "safe_to_reset": True,
+        "notes": (
+            f"All {len(codes)} code(s) classified low severity for {vehicle}. "
+            f"Safe for automated Clear DTC or routine service reset per local policy."
+        ),
+        "details": details,
+    }

@@ -1,24 +1,33 @@
-import random
-from typing import List, Dict
+"""Live ticket polling — real DB rows only (no mock VINs)."""
 
-MOCK_VINS = [
-    "1HGCM82633A004352",
-    "2FMDK3JC1BBA12345",
-    "WDBJF65JX1B123456",
-    "JM1BK32F771234567",
-]
+from typing import Dict, List
+
+from modules.db import ensure_database, fetch_live_tickets, fetch_tickets
 
 
-def poll_tickets(limit: int = 5) -> List[Dict[str, str]]:
-    tickets = []
-    for i in range(min(limit, len(MOCK_VINS))):
-        vin = random.choice(MOCK_VINS)
-        tickets.append(
+def poll_tickets(limit: int = 20) -> List[Dict[str, str]]:
+    """Return the latest live ticket per VIN from the database."""
+    ensure_database()
+    df = fetch_live_tickets(limit=limit)
+    if df.empty:
+        return []
+    rows: List[Dict[str, str]] = []
+    for _, row in df.iterrows():
+        rows.append(
             {
-                "vin": vin,
-                "make": random.choice(["Honda", "Ford", "Mercedes", "Mazda"]),
-                "model": random.choice(["Civic", "Escape", "C300", "CX-5"]),
-                "status": random.choice(["Connected", "Pending", "In Automation", "Waiting"]),
+                "vin": str(row.get("vin") or ""),
+                "make": str(row.get("make") or ""),
+                "model": str(row.get("model") or ""),
+                "status": str(row.get("status") or ""),
+                "device_label": str(row.get("device_label") or ""),
+                "serial": str(row.get("serial") or ""),
+                "last_seen": str(row.get("last_seen") or ""),
             }
         )
-    return tickets
+    return rows
+
+
+def ticket_history(limit: int = 50):
+    """Return recent ticket history dataframe (real events only)."""
+    ensure_database()
+    return fetch_tickets(limit=limit)
