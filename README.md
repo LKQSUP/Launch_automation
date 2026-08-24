@@ -1,6 +1,10 @@
-# LKQ Remote Support Dashboard
+# LKQ Launch automation (Streamlit pages)
 
-Streamlit ops dashboard for LKQ Remote Support: monitor tickets, automate Launch X431 Euro Link on a USB/Wi-Fi tablet, audit VIN detections, and debug stuck controller sessions — **fully local** (no OpenAI/Claude keys).
+Tools for LKQ Remote Support: monitor tickets, automate Launch X431 Euro Link on a USB/Wi-Fi tablet, audit VIN detections, and debug stuck controller sessions — **fully local** (no OpenAI/Claude keys).
+
+This repo is a **set of pages + modules** to embed in an existing Streamlit app (login and home already live on [lkq-toolbox](https://lkq-toolbox.replit.app/)). There is no landing page and no login here.
+
+**Embed into the toolbox:** copy `pages/` and `modules/` into that project. Do **not** copy `main.py` — the toolbox already has its own home (`app`) and login. Scans are attributed to the logged-in engineer (`st.session_state` username / name). Report email defaults to `hotline.support@lkqbelgium.be` unless the engineer sets another address.
 
 ## Features
 - Live Ticket Monitor for connected cars and automation status (real data only)
@@ -11,8 +15,8 @@ Streamlit ops dashboard for LKQ Remote Support: monitor tickets, automate Launch
 
 ## Architecture
 ```
-main.py
-pages/          # Streamlit pages
+main.py         # standalone nav only (ADB Controller is the default page)
+pages/          # copy these into the host Streamlit app
 modules/
   adb_controller.py      # ADB + u2 connection lifecycle
   local_ocr_vision.py    # EasyOCR + OpenCV template match

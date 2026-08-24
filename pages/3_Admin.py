@@ -31,7 +31,10 @@ ensure_database()
 
 st.set_page_config(page_title="Admin — Management & Debug", layout="wide")
 st.title("Admin")
-st.caption("Full management, audit history, and live session debug when the controller is stuck or failing.")
+st.caption(
+    "Full management, audit history, and live session debug when the controller is stuck or failing. "
+    "VIN audit / tickets / reports include the engineer who ran the scan."
+)
 
 tab_mgmt, tab_audit, tab_debug = st.tabs(["Management", "Audit", "Session debug"])
 

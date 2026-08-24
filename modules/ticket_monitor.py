@@ -21,6 +21,7 @@ def poll_tickets(limit: int = 20) -> List[Dict[str, str]]:
                 "status": str(row.get("status") or ""),
                 "device_label": str(row.get("device_label") or ""),
                 "serial": str(row.get("serial") or ""),
+                "engineer": str(row.get("engineer") or ""),
                 "last_seen": str(row.get("last_seen") or ""),
             }
         )

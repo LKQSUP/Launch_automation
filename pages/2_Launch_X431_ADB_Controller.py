@@ -33,6 +33,11 @@ from modules.brand_catalog import (
     has_renault_auto_search,
 )
 from modules.db import fetch_vin_audit
+from modules.engineer_session import (
+    DEFAULT_REPORT_EMAIL,
+    normalize_report_email,
+    resolve_engineer,
+)
 from modules.fca_workflows import FCAWorkflowEngine
 from modules.vag_workflows import VAGWorkflowEngine
 
@@ -42,6 +47,7 @@ st.caption(
     "Multi-brand platform: all groups use **Intelligent Diagnose** first. "
     "VAG: full scan + report email. Renault/Dacia: Automatically Search + model pick. "
     "FCA (Fiat/Jeep/…): **Oil Maintenance Reset** (SGW). "
+    "Scans are saved under the logged-in toolbox engineer. "
     "Sync ADB (USB or Wi-Fi), leave the tablet on EURO LINK home before starting."
 )
 
@@ -253,7 +259,7 @@ st.session_state["vag_brand"] = brand  # legacy key
 if has_full_workflow(brand):
     st.success(
         f"**{brand}** — full VAG workflow: AutoDetect → Diagnostic → Topology scan → "
-        "Report → email to hotline.support@lkqbelgium.be."
+        f"Report → email (default `{DEFAULT_REPORT_EMAIL}`)."
     )
 elif has_renault_auto_search(brand):
     st.success(
@@ -271,6 +277,50 @@ else:
         f"**{brand}** — auto-detect entry enabled (Intelligent Diagnose → AutoDetect Result). "
         "Brand-specific scan/service workflows will be added later; Local Diagnose fallback uses this brand name."
     )
+
+# --- 2b) Engineer (toolbox login) + report recipient ---------------------------
+st.subheader("2b. Engineer & report email")
+st.caption(
+    "Each scan is attached to the engineer who is logged in on the toolbox. "
+    f"Leave report email empty or as `{DEFAULT_REPORT_EMAIL}` unless this report should go to someone else."
+)
+detected_engineer = resolve_engineer()
+from_toolbox_login = bool(detected_engineer)
+op_eng, op_mail = st.columns(2)
+with op_eng:
+    if from_toolbox_login:
+        st.text_input(
+            "Engineer",
+            value=detected_engineer,
+            disabled=True,
+            help="Filled from toolbox login. This scan is stored under your account.",
+        )
+        engineer = detected_engineer
+    else:
+        engineer = (
+            st.text_input(
+                "Engineer",
+                key="engineer_name",
+                help="Toolbox login was not detected in this session. Enter your name so the scan is attributed to you.",
+            )
+            or ""
+        ).strip()
+with op_mail:
+    if "report_email" not in st.session_state:
+        st.session_state["report_email"] = DEFAULT_REPORT_EMAIL
+    report_email_raw = st.text_input(
+        "Report email",
+        key="report_email",
+        help=f"X431 Gmail To: address. Default is {DEFAULT_REPORT_EMAIL}.",
+    )
+report_email = normalize_report_email(report_email_raw)
+typed_mail = (report_email_raw or "").strip()
+if typed_mail and typed_mail.lower() != report_email.lower():
+    st.warning(f"That address is not valid — reports will go to `{DEFAULT_REPORT_EMAIL}`.")
+if from_toolbox_login:
+    st.caption(f"Logged in as **{engineer}**")
+elif not engineer:
+    st.warning("Log in on the toolbox, or type your engineer name, before starting a scan.")
 
 # --- 3) Start / Stop / Hard Reset ----------------------------------------------
 st.subheader("3. Start auto detection")
@@ -293,6 +343,8 @@ if "autodetect_ctl" not in st.session_state:
         "serial": None,
         "current_step": None,
         "step_count": 0,
+        "engineer": None,
+        "report_email": None,
     }
 ctl = st.session_state["autodetect_ctl"]
 
@@ -370,7 +422,7 @@ with run_col:
         "Start auto detection",
         type="primary",
         use_container_width=True,
-        disabled=bool(ctl.get("running")),
+        disabled=bool(ctl.get("running")) or not bool(engineer),
     )
 with stop_col:
     stop = st.button(
@@ -398,7 +450,7 @@ if has_fca_oil_reset(brand):
         "Start Oil Maintenance Reset (FCA / SGW)",
         type="primary",
         use_container_width=True,
-        disabled=bool(ctl.get("running")),
+        disabled=bool(ctl.get("running")) or not bool(engineer),
         help="Fiat 500e-style: Diagnostic → OK confirm → SGW OK → Common Special Function → Oil reset → home.",
     )
 
@@ -432,7 +484,13 @@ if hard_reset:
         st.error("Hard reset finished with errors — check the step log below.")
 
 
-def _run_autodetect_worker(serial_id: str, brand_name: str, control: dict) -> None:
+def _run_autodetect_worker(
+    serial_id: str,
+    brand_name: str,
+    control: dict,
+    engineer: str,
+    report_email: str,
+) -> None:
     """Background worker so Stop / Hard Reset can interrupt via cancel Event."""
 
     def emit(message: str, progress: float | None = None) -> None:
@@ -454,6 +512,8 @@ def _run_autodetect_worker(serial_id: str, brand_name: str, control: dict) -> No
         callback=emit,
         preferred_brand=brand_name,
         cancel_check=cancel_check,
+        engineer=engineer,
+        report_email=report_email,
     )
     try:
         outcome = engine.start_auto_detection(brand=brand_name)
@@ -486,7 +546,13 @@ def _run_autodetect_worker(serial_id: str, brand_name: str, control: dict) -> No
         control["running"] = False
 
 
-def _run_fca_oil_worker(serial_id: str, brand_name: str, control: dict) -> None:
+def _run_fca_oil_worker(
+    serial_id: str,
+    brand_name: str,
+    control: dict,
+    engineer: str,
+    report_email: str,
+) -> None:
     def emit(message: str, progress: float | None = None) -> None:
         stamp = time.strftime("%H:%M:%S")
         entry = {"t": stamp, "msg": message}
@@ -506,6 +572,8 @@ def _run_fca_oil_worker(serial_id: str, brand_name: str, control: dict) -> None:
         callback=emit,
         preferred_brand=brand_name,
         cancel_check=cancel_check,
+        engineer=engineer,
+        report_email=report_email,
     )
     try:
         outcome = engine.start_fca_oil_maintenance_reset(brand=brand_name)
@@ -541,16 +609,18 @@ if start and not ctl.get("running"):
     ctl["started_at"] = time.time()
     ctl["brand"] = brand
     ctl["serial"] = serial
+    ctl["engineer"] = engineer
+    ctl["report_email"] = report_email
     ctl["current_step"] = f"Start auto detection — {brand}"
     ctl["step_count"] = 0
     ctl["phase"] = "Starting…"
     # Seed first visible step
     stamp = time.strftime("%H:%M:%S")
-    ctl["logs"] = [{"t": stamp, "msg": f"Start auto detection — {brand}"}]
+    ctl["logs"] = [{"t": stamp, "msg": f"Start auto detection — {brand} · engineer={engineer}"}]
     ctl["step_count"] = 1
     worker = threading.Thread(
         target=_run_autodetect_worker,
-        args=(serial, brand, ctl),
+        args=(serial, brand, ctl, engineer, report_email),
         daemon=True,
         name="vag-autodetect",
     )
@@ -567,21 +637,30 @@ if start_fca_oil and not ctl.get("running"):
     ctl["started_at"] = time.time()
     ctl["brand"] = brand
     ctl["serial"] = serial
+    ctl["engineer"] = engineer
+    ctl["report_email"] = report_email
     ctl["current_step"] = f"FCA oil reset — {brand}"
     ctl["step_count"] = 1
     ctl["phase"] = "FCA · Oil Maintenance Reset"
     stamp = time.strftime("%H:%M:%S")
-    ctl["logs"] = [{"t": stamp, "msg": f"FCA oil reset — {brand}"}]
+    ctl["logs"] = [{"t": stamp, "msg": f"FCA oil reset — {brand} · engineer={engineer}"}]
     threading.Thread(
         target=_run_fca_oil_worker,
-        args=(serial, brand, ctl),
+        args=(serial, brand, ctl, engineer, report_email),
         daemon=True,
         name="fca-oil-reset",
     ).start()
     st.rerun()
 
 
-def _run_topology_action_worker(serial_id: str, brand_name: str, control: dict, action: str) -> None:
+def _run_topology_action_worker(
+    serial_id: str,
+    brand_name: str,
+    control: dict,
+    action: str,
+    engineer: str,
+    report_email: str,
+) -> None:
     """Report / Clear All DTCs from System and Function / Topology."""
 
     def emit(message: str, progress: float | None = None) -> None:
@@ -603,6 +682,8 @@ def _run_topology_action_worker(serial_id: str, brand_name: str, control: dict, 
         callback=emit,
         preferred_brand=brand_name,
         cancel_check=cancel_check,
+        engineer=engineer,
+        report_email=report_email,
     )
     prev = dict(control.get("outcome") or {})
     try:
@@ -648,7 +729,7 @@ with act_report:
     do_report = st.button(
         "Report",
         use_container_width=True,
-        disabled=bool(ctl.get("running")) or not bool(serial),
+        disabled=bool(ctl.get("running")) or not bool(serial) or not bool(engineer),
         help="Must be on System and Function / Topology. Runs Report → email → Back.",
     )
 with act_clear:
@@ -668,6 +749,8 @@ def _start_topology_action(action: str, label: str) -> None:
     ctl["started_at"] = ctl.get("started_at") or time.time()
     ctl["brand"] = brand
     ctl["serial"] = serial
+    ctl["engineer"] = engineer
+    ctl["report_email"] = report_email
     ctl["current_step"] = label
     ctl["phase"] = label
     stamp = time.strftime("%H:%M:%S")
@@ -675,7 +758,7 @@ def _start_topology_action(action: str, label: str) -> None:
     ctl["step_count"] = int(ctl.get("step_count") or 0) + 1
     threading.Thread(
         target=_run_topology_action_worker,
-        args=(serial, brand, ctl, action),
+        args=(serial, brand, ctl, action, engineer, report_email),
         daemon=True,
         name=f"vag-{action}",
     ).start()
@@ -698,7 +781,7 @@ if ctl.get("running") or ctl.get("logs") or ctl.get("outcome") is not None or ct
     phase = ctl.get("phase") or _phase_from_step(str(current), progress)
     elapsed = _fmt_elapsed(ctl.get("started_at"))
 
-    s1, s2, s3, s4 = st.columns(4)
+    s1, s2, s3, s4, s5 = st.columns(5)
     if ctl.get("running"):
         s1.metric("Status", "RUNNING")
     elif ctl.get("error"):
@@ -710,13 +793,16 @@ if ctl.get("running") or ctl.get("logs") or ctl.get("outcome") is not None or ct
     s2.metric("Elapsed", elapsed)
     s3.metric("Steps", int(ctl.get("step_count") or len(ctl.get("logs") or [])))
     s4.metric("Brand", ctl.get("brand") or brand)
+    s5.metric("Engineer", ctl.get("engineer") or engineer or "—")
 
     st.progress(progress)
     st.caption(f"Progress {int(progress * 100)}% · {phase}")
     st.info(f"**Current step:** {current}")
     st.caption(
         f"Phase: {phase} · Device: `{get_device_label(ctl.get('serial') or serial)}` · "
-        f"Serial: `{ctl.get('serial') or serial}`"
+        f"Serial: `{ctl.get('serial') or serial}` · "
+        f"Engineer: `{ctl.get('engineer') or engineer or '—'}` · "
+        f"Report to: `{ctl.get('report_email') or report_email}`"
     )
 
     if ctl.get("running"):
@@ -748,8 +834,9 @@ if ctl.get("running") or ctl.get("logs") or ctl.get("outcome") is not None or ct
         else:
             m5.metric("Email", outcome.get("emailed_to") or "—")
             st.success(
-                f"Full scan complete on `{device_name}` · report emailed to "
-                f"`{outcome.get('emailed_to') or 'hotline.support@lkqbelgium.be'}`"
+                f"Full scan complete on `{device_name}` · engineer `{outcome.get('engineer') or ctl.get('engineer') or engineer or '—'}` · "
+                f"report emailed to "
+                f"`{outcome.get('emailed_to') or DEFAULT_REPORT_EMAIL}`"
             )
     elif err and not ctl.get("running"):
         st.error(err)

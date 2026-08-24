@@ -1,17 +1,21 @@
 import sqlite3
+from contextvars import ContextVar
 from pathlib import Path
 import pandas as pd
 from typing import List, Dict, Any, Optional
 
+# Set on the worker thread when a scan starts so every save_* row is attributed.
+_operator: ContextVar[Dict[str, str]] = ContextVar("lkq_operator", default={})
+
 DB_PATH = Path(__file__).resolve().parent.parent / "lkq_remote_support.db"
 
 SCHEMA = [
-    "CREATE TABLE IF NOT EXISTS tickets (id INTEGER PRIMARY KEY AUTOINCREMENT, vin TEXT, make TEXT, model TEXT, status TEXT, serial TEXT, device_label TEXT, last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
-    "CREATE TABLE IF NOT EXISTS cases (id INTEGER PRIMARY KEY AUTOINCREMENT, vin TEXT, make TEXT, model TEXT, summary TEXT, serial TEXT, device_label TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
-    "CREATE TABLE IF NOT EXISTS dtc_history (id INTEGER PRIMARY KEY AUTOINCREMENT, vin TEXT, dtc_code TEXT, dtc_description TEXT, source TEXT, serial TEXT, device_label TEXT, recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
-    "CREATE TABLE IF NOT EXISTS ai_summaries (id INTEGER PRIMARY KEY AUTOINCREMENT, vin TEXT, make TEXT, model TEXT, dtc_text TEXT, recommendation TEXT, ai_notes TEXT, serial TEXT, device_label TEXT, generated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
-    "CREATE TABLE IF NOT EXISTS reports (id INTEGER PRIMARY KEY AUTOINCREMENT, serial TEXT, device_label TEXT, workflow TEXT, status TEXT, summary TEXT, file_path TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
-    "CREATE TABLE IF NOT EXISTS vin_audit (id INTEGER PRIMARY KEY AUTOINCREMENT, serial TEXT, device_label TEXT, brand_selected TEXT, make_detected TEXT, model TEXT, vin TEXT, software TEXT, source TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
+    "CREATE TABLE IF NOT EXISTS tickets (id INTEGER PRIMARY KEY AUTOINCREMENT, vin TEXT, make TEXT, model TEXT, status TEXT, serial TEXT, device_label TEXT, engineer TEXT, last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
+    "CREATE TABLE IF NOT EXISTS cases (id INTEGER PRIMARY KEY AUTOINCREMENT, vin TEXT, make TEXT, model TEXT, summary TEXT, serial TEXT, device_label TEXT, engineer TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
+    "CREATE TABLE IF NOT EXISTS dtc_history (id INTEGER PRIMARY KEY AUTOINCREMENT, vin TEXT, dtc_code TEXT, dtc_description TEXT, source TEXT, serial TEXT, device_label TEXT, engineer TEXT, recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
+    "CREATE TABLE IF NOT EXISTS ai_summaries (id INTEGER PRIMARY KEY AUTOINCREMENT, vin TEXT, make TEXT, model TEXT, dtc_text TEXT, recommendation TEXT, ai_notes TEXT, serial TEXT, device_label TEXT, engineer TEXT, generated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
+    "CREATE TABLE IF NOT EXISTS reports (id INTEGER PRIMARY KEY AUTOINCREMENT, serial TEXT, device_label TEXT, workflow TEXT, status TEXT, summary TEXT, file_path TEXT, engineer TEXT, report_email TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
+    "CREATE TABLE IF NOT EXISTS vin_audit (id INTEGER PRIMARY KEY AUTOINCREMENT, serial TEXT, device_label TEXT, brand_selected TEXT, make_detected TEXT, model TEXT, vin TEXT, software TEXT, source TEXT, engineer TEXT, report_email TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
 ]
 
 # Columns added after initial schema — applied on ensure_database().
@@ -27,7 +31,35 @@ _SCHEMA_MIGRATIONS = [
     ("dtc_history", "device_label", "TEXT"),
     ("ai_summaries", "serial", "TEXT"),
     ("ai_summaries", "device_label", "TEXT"),
+    ("tickets", "engineer", "TEXT"),
+    ("cases", "engineer", "TEXT"),
+    ("dtc_history", "engineer", "TEXT"),
+    ("ai_summaries", "engineer", "TEXT"),
+    ("reports", "engineer", "TEXT"),
+    ("reports", "report_email", "TEXT"),
+    ("vin_audit", "engineer", "TEXT"),
+    ("vin_audit", "report_email", "TEXT"),
 ]
+
+
+def set_operator_context(engineer: str = "", report_email: str = "") -> None:
+    """Bind engineer + report recipient for all save_* calls on this thread."""
+    _operator.set(
+        {
+            "engineer": (engineer or "").strip(),
+            "report_email": (report_email or "").strip(),
+        }
+    )
+
+
+def _operator_fields(
+    engineer: Optional[str] = None,
+    report_email: Optional[str] = None,
+) -> tuple[str, str]:
+    ctx = _operator.get() or {}
+    eng = (engineer or "").strip() or str(ctx.get("engineer") or "").strip()
+    mail = (report_email or "").strip() or str(ctx.get("report_email") or "").strip()
+    return eng, mail
 
 
 def _device_label_for(serial: str, device_label: Optional[str] = None) -> str:
@@ -66,6 +98,8 @@ def with_device_columns(df: pd.DataFrame) -> pd.DataFrame:
         preferred = []
         if "id" in cols:
             preferred.append("id")
+        if "engineer" in cols:
+            preferred.append("engineer")
         if "device_label" in cols:
             preferred.append("device_label")
         if "serial" in cols:
@@ -118,15 +152,18 @@ def save_case(
     summary: str,
     serial: str = "",
     device_label: Optional[str] = None,
+    engineer: Optional[str] = None,
 ):
     ensure_database()
     serial = (serial or "").strip()
     label = _device_label_for(serial, device_label)
+    eng, _ = _operator_fields(engineer)
     conn = get_connection()
     try:
         conn.execute(
-            "INSERT INTO cases (vin, make, model, summary, serial, device_label) VALUES (?, ?, ?, ?, ?, ?)",
-            (vin, make, model, summary, serial, label),
+            "INSERT INTO cases (vin, make, model, summary, serial, device_label, engineer) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (vin, make, model, summary, serial, label, eng),
         )
         conn.commit()
     finally:
@@ -140,6 +177,7 @@ def save_ticket(
     status: str,
     serial: str = "",
     device_label: Optional[str] = None,
+    engineer: Optional[str] = None,
 ):
     """Persist a real live ticket event (from device workflows / Jifeline)."""
     vin = (vin or "").strip()
@@ -148,11 +186,13 @@ def save_ticket(
     ensure_database()
     serial = (serial or "").strip()
     label = _device_label_for(serial, device_label)
+    eng, _ = _operator_fields(engineer)
     conn = get_connection()
     try:
         conn.execute(
-            "INSERT INTO tickets (vin, make, model, status, serial, device_label) VALUES (?, ?, ?, ?, ?, ?)",
-            (vin, make or "", model or "", status or "", serial, label),
+            "INSERT INTO tickets (vin, make, model, status, serial, device_label, engineer) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (vin, make or "", model or "", status or "", serial, label, eng),
         )
         conn.commit()
     finally:
@@ -221,16 +261,18 @@ def save_dtc(
     source: str = "manual",
     serial: str = "",
     device_label: Optional[str] = None,
+    engineer: Optional[str] = None,
 ):
     ensure_database()
     serial = (serial or "").strip()
     label = _device_label_for(serial, device_label)
+    eng, _ = _operator_fields(engineer)
     conn = get_connection()
     try:
         conn.execute(
-            "INSERT INTO dtc_history (vin, dtc_code, dtc_description, source, serial, device_label) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (vin, dtc_code, dtc_description, source, serial, label),
+            "INSERT INTO dtc_history (vin, dtc_code, dtc_description, source, serial, device_label, engineer) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (vin, dtc_code, dtc_description, source, serial, label, eng),
         )
         conn.commit()
     finally:
@@ -246,16 +288,18 @@ def save_ai_summary(
     ai_notes: str,
     serial: str = "",
     device_label: Optional[str] = None,
+    engineer: Optional[str] = None,
 ):
     ensure_database()
     serial = (serial or "").strip()
     label = _device_label_for(serial, device_label)
+    eng, _ = _operator_fields(engineer)
     conn = get_connection()
     try:
         conn.execute(
-            "INSERT INTO ai_summaries (vin, make, model, dtc_text, recommendation, ai_notes, serial, device_label) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (vin, make, model, dtc_text, recommendation, ai_notes, serial, label),
+            "INSERT INTO ai_summaries (vin, make, model, dtc_text, recommendation, ai_notes, serial, device_label, engineer) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (vin, make, model, dtc_text, recommendation, ai_notes, serial, label, eng),
         )
         conn.commit()
     finally:
@@ -269,19 +313,26 @@ def save_report(
     summary: str,
     file_path: str | None = None,
     device_label: Optional[str] = None,
+    engineer: Optional[str] = None,
+    report_email: Optional[str] = None,
 ):
     ensure_database()
     serial = (serial or "").strip()
     label = _device_label_for(serial, device_label)
+    eng, mail = _operator_fields(engineer, report_email)
     # Keep device identity visible inside the summary text for export/search.
     prefix = f"[device={label}|serial={serial}] " if serial else ""
+    if eng and "[engineer=" not in str(summary):
+        prefix = f"{prefix}[engineer={eng}] "
+    if mail and "[to=" not in str(summary):
+        prefix = f"{prefix}[to={mail}] "
     summary_text = summary if str(summary).startswith("[device=") else f"{prefix}{summary}"
     conn = get_connection()
     try:
         conn.execute(
-            "INSERT INTO reports (serial, device_label, workflow, status, summary, file_path) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (serial, label, workflow, status, summary_text, file_path),
+            "INSERT INTO reports (serial, device_label, workflow, status, summary, file_path, engineer, report_email) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (serial, label, workflow, status, summary_text, file_path, eng, mail),
         )
         conn.commit()
     finally:
@@ -326,17 +377,20 @@ def save_vin_audit(
     source: str = "intelligent_diagnose",
     model: str = "",
     device_label: Optional[str] = None,
+    engineer: Optional[str] = None,
+    report_email: Optional[str] = None,
 ) -> None:
     """Persist an AutoDetect VIN result for audit history."""
     ensure_database()
     serial = (serial or "").strip()
     label = _device_label_for(serial, device_label)
+    eng, mail = _operator_fields(engineer, report_email)
     conn = get_connection()
     try:
         conn.execute(
-            "INSERT INTO vin_audit (serial, device_label, brand_selected, make_detected, model, vin, software, source) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (serial, label, brand_selected, make_detected, model or "", vin, software, source),
+            "INSERT INTO vin_audit (serial, device_label, brand_selected, make_detected, model, vin, software, source, engineer, report_email) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (serial, label, brand_selected, make_detected, model or "", vin, software, source, eng, mail),
         )
         conn.commit()
     finally:

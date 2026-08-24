@@ -3,7 +3,8 @@
 Scope (current phase):
   1. Identify vehicle (Intelligent Diagnose / Local Diagnose → VAG brand)
   2. Full system DTC read (High-speed Scan / Smart Detection)
-  3. Save X431 Inspection Report and email via Gmail to hotline.support@lkqbelgium.be
+  3. Save X431 Inspection Report and email via Gmail
+     (default To: hotline.support@lkqbelgium.be; overridable per scan)
   4. Optional DTC clear / service reset (Oil / Brake / SAS / BMS)
 
 Navigation is state-driven: read visible tablet UI text and advance to the
@@ -23,7 +24,8 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 _U2_RPC = ThreadPoolExecutor(max_workers=2, thread_name_prefix="u2rpc")
 
 from modules import adb_controller as adb
-from modules.db import ensure_database, save_report, save_vin_audit, save_ticket
+from modules.db import ensure_database, save_report, save_vin_audit, save_ticket, set_operator_context
+from modules.engineer_session import DEFAULT_REPORT_EMAIL as REPORT_EMAIL
 from modules.local_ocr_vision import LocalVisionEngine
 from modules.x431_workflows import (
     HOME_AUTO_DIAGNOSE,
@@ -88,15 +90,17 @@ TOPOLOGY_SCAN_BUTTONS: Sequence[str] = tuple(HIGH_SPEED_SCAN_LABELS) + tuple(SMA
 SCAN_BUTTON_LABELS: Sequence[str] = TOPOLOGY_SCAN_BUTTONS
 
 # After full ECU scan: save report and email via Gmail.
-REPORT_EMAIL = "hotline.support@lkqbelgium.be"
+# REPORT_EMAIL imported from engineer_session (hotline.support@lkqbelgium.be).
 # 1280×800 fallbacks (text tap is preferred).
 POINT_TOPOLOGY_REPORT = (0.42, 0.91)  # left of Clear All DTCs; prefer exact text tap
 POINT_DIALOG_OK = (0.50, 0.72)
+# Diagnostic Firewall Activated — large white OK, bottom-right of the warning page
+POINT_FIREWALL_OK = (0.82, 0.82)
 POINT_MORE_INFO_OK = (0.62, 0.78)
 POINT_OTHER_SHARE = (0.70, 0.91)
 POINT_SHARE_GMAIL = (0.50, 0.56)
-# Gmail compose: blue Send arrow is LEFT of the ⋮ menu (not paperclip, not overflow).
-POINT_GMAIL_SEND = (0.86, 0.055)
+# Gmail compose: blue Send triangle — middle of paperclip / Send / ⋮ (top-right).
+POINT_GMAIL_SEND = (0.89, 0.055)
 POINT_CLEAR_ALL_DTCS = (0.88, 0.91)
 VIN_RE = re.compile(r"\b([A-HJ-NPR-Z0-9]{17})\b")
 VIN_FULL = re.compile(r"^[A-HJ-NPR-Z0-9]{17}$")
@@ -205,8 +209,16 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
         vision: Optional[LocalVisionEngine] = None,
         preferred_brand: str = "Volkswagen",
         cancel_check: Optional[Callable[[], bool]] = None,
+        engineer: str = "",
+        report_email: str = "",
     ) -> None:
-        super().__init__(serial, callback=callback, vision=vision)
+        super().__init__(
+            serial,
+            callback=callback,
+            vision=vision,
+            engineer=engineer,
+            report_email=report_email,
+        )
         self.preferred_brand = preferred_brand
         self.detected_vin: str = "UNKNOWN"
         self.detected_make: str = ""
@@ -215,6 +227,7 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
         self._u2_failed = False
         self._win_wh: Tuple[int, int] = (1280, 800)
         ensure_database()
+        set_operator_context(self.engineer, self.report_email)
 
     def cancelled(self) -> bool:
         try:
@@ -379,6 +392,85 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
             self._adb_tap(int(w * 0.62), int(h * 0.72))
             return True
         return False
+
+    def is_diagnostic_firewall(self, blob: str = "") -> bool:
+        """True on VAG 'Diagnostic Firewall Activated' (hood-open) warning."""
+        low = (blob or "").lower()
+        if not low:
+            if self._u2_has_text(
+                "Diagnostic Firewall Activated", "Diagnostic Firewall", timeout=0.06
+            ):
+                return True
+            if self._u2_has_text("Hood To Be Open", "Hood Latched Closed", timeout=0.05):
+                return True
+            low = self._adb_screen_blob()
+        if "firewall" in low and "diagnos" in low:
+            return True
+        if "hood to be open" in low or "hood latched" in low:
+            return True
+        return False
+
+    def dismiss_diagnostic_firewall(self) -> bool:
+        """If the VAG Diagnostic Firewall page is up, capture VIN and tap OK.
+
+        Can appear before Topology, or just before/after High-speed Scan.
+        """
+        blob = self._adb_screen_blob()
+        if not self.is_diagnostic_firewall(blob):
+            return False
+
+        # VIN is on the bottom-left of this page (e.g. VIN WVGZZZ5NZKW347266)
+        m = re.search(r"VIN\s*[:：]?\s*([A-HJ-NPR-Z0-9]{17})", blob, re.IGNORECASE)
+        if not m:
+            m = VIN_RE.search((blob or "").upper())
+        if m:
+            vin = m.group(1).upper()
+            if VIN_FULL.match(vin):
+                self.detected_vin = vin
+                self._step(f"Diagnostic Firewall — VIN {vin}", 0.93)
+
+        self._step("Diagnostic Firewall Activated — tapping OK", 0.93)
+        w, h = self._window_size()
+        tapped = False
+        try:
+            candidates: List[Tuple[int, int, int]] = []
+            for el in adb.get_ui_elements(self.serial):
+                raw = (el.get("text") or el.get("content_desc") or "").strip()
+                if raw.upper() != "OK":
+                    continue
+                match = re.search(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", el.get("bounds") or "")
+                if not match:
+                    continue
+                l, t, r, b = (int(match.group(i)) for i in range(1, 5))
+                x, y = (l + r) // 2, (t + b) // 2
+                if y < int(h * 0.55) or x < int(w * 0.45):
+                    continue
+                candidates.append((x, y, (r - l) * (b - t)))
+            if candidates:
+                candidates.sort(key=lambda item: item[0], reverse=True)
+                x, y, _a = candidates[0]
+                self._adb_tap(x, y)
+                tapped = True
+                self._step(f"Tapped Firewall OK at ({x},{y})")
+        except Exception as exc:
+            self._step(f"Firewall OK lookup skip: {exc}")
+
+        if not tapped:
+            try:
+                if adb.find_and_tap_text(self.serial, "OK", timeout=2):
+                    tapped = True
+                    self._step("Tapped Firewall OK (ADB text)")
+            except Exception:
+                pass
+
+        if not tapped:
+            x, y = int(w * POINT_FIREWALL_OK[0]), int(h * POINT_FIREWALL_OK[1])
+            self._adb_tap(x, y)
+            tapped = True
+            self._step(f"Tapped Firewall OK (layout) at ({x},{y})")
+
+        time.sleep(0.45)
+        return True
 
     def screen_contains(self, *needles: str) -> bool:
         blob = " | ".join(self.visible_texts()).lower()
@@ -1093,11 +1185,15 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
         if self._tap_u2_text("Diagnostic"):
             result.update(ok=True, method="u2")
             self._step("Tapped Diagnostic (text)", 0.92)
+            time.sleep(0.4)
+            self.dismiss_diagnostic_firewall()
             return result
         try:
             if adb.find_and_tap_text(self.serial, "Diagnostic", timeout=2):
                 result.update(ok=True, method="adb_text")
                 self._step("Tapped Diagnostic (ADB text)", 0.92)
+                time.sleep(0.4)
+                self.dismiss_diagnostic_firewall()
                 return result
         except Exception as exc:
             self._step(f"ADB Diagnostic tap skip: {exc}")
@@ -1106,6 +1202,8 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
         self._adb_tap(x, y)
         result.update(ok=True, method="layout", point=(x, y))
         self._step(f"Tapped Diagnostic (left card) at ({x},{y})", 0.92)
+        time.sleep(0.4)
+        self.dismiss_diagnostic_firewall()
         return result
 
     # ------------------------------------------------------------------ Renault
@@ -1610,6 +1708,9 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
 
     def is_system_function_page(self) -> bool:
         """True on System and Function / Topology (High-speed Scan or Smart Detection)."""
+        # Firewall warning sits in front of Topology — do not treat it as the scan page
+        if self.is_diagnostic_firewall():
+            return False
         if self._u2_has_text("System and Function", "System Topology", timeout=0.08):
             return True
         if self._u2_has_text("High-speed Scan", "Smart Detection", timeout=0.08):
@@ -1664,6 +1765,10 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
             self.raise_if_cancelled()
             remaining = int(deadline - time.time())
             now = time.time()
+
+            if self.dismiss_diagnostic_firewall():
+                last_adb = 0.0
+                continue
 
             on_topo = self.is_system_function_page()
             if not on_topo and now - last_adb >= 1.0:
@@ -1882,6 +1987,7 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
         """
         result: Dict[str, object] = {"ok": False, "button": None, "error": None, "point": None}
         w, h = self._window_size()
+        self.dismiss_diagnostic_firewall()
 
         # 1) ADB text search first (reliable when u2 is down)
         for label in ("High-speed Scan", "High speed Scan", "High-Speed Scan"):
@@ -1889,6 +1995,8 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
                 if adb.find_and_tap_text(self.serial, label, timeout=3):
                     result.update(ok=True, button="High-speed Scan", method="adb_text")
                     self._step(f"Tapped High-speed Scan (ADB text '{label}')", 0.95)
+                    time.sleep(0.35)
+                    self.dismiss_diagnostic_firewall()
                     return result
             except Exception as exc:
                 self._step(f"ADB High-speed Scan skip: {exc}")
@@ -1905,11 +2013,15 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
             label, x, y = hit
             result.update(ok=True, button=label, point=(x, y), method="dump_bounds")
             self._step(f"Tapped High-speed Scan '{label}' at ({x},{y})", 0.95)
+            time.sleep(0.35)
+            self.dismiss_diagnostic_firewall()
             return result
 
         if self._tap_u2_text("High-speed Scan"):
             result.update(ok=True, button="High-speed Scan", method="u2")
             self._step("Tapped High-speed Scan (u2)", 0.95)
+            time.sleep(0.35)
+            self.dismiss_diagnostic_firewall()
             return result
 
         # 3) Smart Detection fallback (same right footer row)
@@ -1917,6 +2029,8 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
             if adb.find_and_tap_text(self.serial, "Smart Detection", timeout=3):
                 result.update(ok=True, button="Smart Detection", method="adb_text")
                 self._step("High-speed Scan not found — tapped Smart Detection (ADB)", 0.95)
+                time.sleep(0.35)
+                self.dismiss_diagnostic_firewall()
                 return result
         except Exception:
             pass
@@ -2088,6 +2202,10 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
                     blob = " ".join(self._adb_ui_texts()).lower()
                 except Exception:
                     blob = ""
+
+            if self.is_diagnostic_firewall(blob) or self.dismiss_diagnostic_firewall():
+                last_adb = 0.0
+                continue
 
             if self._ecu_scan_done_visible(blob):
                 self._step(
@@ -2269,7 +2387,7 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
             return True
         return False
 
-    def send_scan_report_via_gmail(self, to_email: str = REPORT_EMAIL) -> Dict[str, object]:
+    def send_scan_report_via_gmail(self, to_email: Optional[str] = None) -> Dict[str, object]:
         """Exact post-scan report flow:
 
         1. Tap Report (Topology footer)
@@ -2280,9 +2398,11 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
         6. Compose → recipient → Send
         7. Back to System and Function / Topology
         """
+        dest = (to_email or getattr(self, "report_email", "") or REPORT_EMAIL).strip() or REPORT_EMAIL
         out: Dict[str, object] = {
             "ok": False,
-            "emailed_to": to_email,
+            "emailed_to": dest,
+            "engineer": getattr(self, "engineer", "") or "",
             "error": None,
             "returned_to_topology": False,
         }
@@ -2353,52 +2473,38 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
             out["error"] = "Step 5 failed: could not tap Gmail"
             self._step(out["error"])
             return out
-        time.sleep(0.6)
+        time.sleep(0.25)
 
-        # ── 6) Compose + Send ──────────────────────────────────────
-        self._step("Step 6/7 — Gmail compose → verify To → Send (blue arrow)", 0.996)
-        if not self._wait_gmail_compose(timeout=22):
-            # ADB fallback recognition
+        # ── 6) Compose + Send (fast path) ──────────────────────────
+        self._step("Step 6/7 — Gmail compose → To → Send", 0.996)
+        if not self._wait_gmail_compose(timeout=6):
             blob = self._adb_screen_blob()
-            if "compose" not in blob and "subject" not in blob and "@" not in blob:
+            if "diagnostic report" not in blob and "gmail" not in blob and "@" not in blob:
                 out["error"] = "Step 6 failed: Gmail compose screen did not open"
                 self._step(out["error"])
                 return out
 
-        # Dismiss attachment overflow if present (Copy / Remove menu — not Send)
-        blob = self._adb_screen_blob()
-        if "copy" in blob or "remove" in blob:
-            w, h = self._window_size()
-            self._adb_tap(int(w * 0.50), int(h * 0.42))
-            time.sleep(0.2)
+        # VIN audit: use cached VIN — skip slow dump on the hot path
+        if self.detected_vin and self.detected_vin != "UNKNOWN":
+            out["vin"] = self.detected_vin
+        else:
+            try:
+                out["vin"] = self.capture_and_save_vin_audit(source="gmail_report_compose")
+            except Exception:
+                out["vin"] = self.detected_vin or "UNKNOWN"
 
-        # Capture VIN for Admin audit (Topology footer / AutoDetect / PDF name)
-        out["vin"] = self.capture_and_save_vin_audit(source="gmail_report_compose")
-
-        # Must have the correct To address before Send — never send with empty/wrong To
-        to_email = (to_email or REPORT_EMAIL).strip() or REPORT_EMAIL
+        to_email = dest
         out["emailed_to"] = to_email
-        filled = False
-        for attempt in range(1, 4):
-            self._step(f"Step 6b — Fill To with {to_email} (attempt {attempt}/3)", 0.996)
-            if self._ensure_gmail_recipient(to_email):
-                filled = True
-                break
-            time.sleep(0.35)
-        if not filled:
-            out["error"] = (
-                f"Step 6 failed: could not set To to {to_email} — Send aborted"
-            )
-            self._step(out["error"])
-            return out
-
-        self._step(f"To confirmed ({to_email}) — tapping Send (blue arrow)", 0.997)
+        self._step(f"Step 6b — Fill To + Send: {to_email}", 0.996)
+        self._ensure_gmail_recipient(to_email)
+        # Always Send after fill — do not abort on To-verify (chip/dump can lag)
+        self._step("Tapping Gmail Send (blue arrow, top-right)", 0.997)
         self._tap_gmail_send()
-        time.sleep(0.55)
+        time.sleep(0.35)
 
         # ── 7) Back to Topology ────────────────────────────────────
         self._step("Step 7/7 — Back to System and Function / Topology", 0.998)
-        if not self.return_to_system_topology_after_email(timeout=28):
+        if not self.return_to_system_topology_after_email(timeout=18):
             out["error"] = (
                 "Report emailed but could not confirm return to System and Function / Topology"
             )
@@ -2513,13 +2619,14 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
             "Open that page first (after a scan), then use this button."
         )
 
-    def resend_topology_report(self, to_email: str = REPORT_EMAIL) -> Dict[str, object]:
+    def resend_topology_report(self, to_email: Optional[str] = None) -> Dict[str, object]:
         """Dashboard Report button: Topology → report workflow → email → Topology."""
         err = self.require_system_function_topology()
         if err:
             self._step(err)
             return {"ok": False, "error": err}
-        return self.send_scan_report_via_gmail(to_email)
+        dest = (to_email or self.report_email or REPORT_EMAIL).strip() or REPORT_EMAIL
+        return self.send_scan_report_via_gmail(dest)
 
     def clear_all_dtcs(self) -> Dict[str, object]:
         """Dashboard Clear All DTCs: only taps when already on Topology."""
@@ -2548,264 +2655,255 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
         self._step("Clear All DTCs tapped", 1.0)
         return out
 
-    def _wait_gmail_compose(self, timeout: float = 20.0) -> bool:
+    def _wait_gmail_compose(self, timeout: float = 6.0) -> bool:
+        """Fast compose detect — ADB blob first (u2 often unavailable)."""
         deadline = time.time() + timeout
         while time.time() < deadline:
             self.raise_if_cancelled()
-            if self._u2_has_text("Diagnostic Report", timeout=0.05):
+            if self._u2_has_text("Diagnostic Report", timeout=0.04):
                 return True
-            try:
-                device = self.ensure_device()
-                send = device(description="Send")
-                if self._u2_rpc(lambda: send.exists(timeout=0.08), timeout=0.25, default=False):
-                    return True
-            except Exception:
-                pass
-            time.sleep(0.15)
-        return False
-
-    def _gmail_to_is_correct(self, to_email: str) -> bool:
-        """True only when To has hotline / LKQ Support — ignore unrelated Suggestions."""
-        want = (to_email or REPORT_EMAIL).strip().lower()
-        local = want.split("@", 1)[0]
-        texts: List[str] = []
-        try:
-            for el in adb.get_ui_elements(self.serial):
-                raw = (el.get("text") or el.get("content_desc") or "").strip()
-                if raw:
-                    texts.append(raw)
-        except Exception:
-            pass
-        blob = " ".join(texts).lower()
-        if not blob:
             blob = self._adb_screen_blob()
-
-        # Exact address or known LKQ hotline contact chip
-        if want and want in blob:
-            return True
-        if local and local in blob and "lkq" in blob:
-            return True
-        if "hotline.support" in blob and "lkqbelgium" in blob:
-            return True
-        if "hotline.support@lkqbelgium.be" in blob:
-            return True
-        # Saved contact chip for the hotline mailbox
-        if "lkq support" in blob:
-            return True
+            if "diagnostic report" in blob or ("from" in blob and "to" in blob):
+                return True
+            if "send" in blob and "@" in blob:
+                return True
+            time.sleep(0.12)
         return False
+
+    def _gmail_to_is_correct_fast(self, to_email: str, blob: str = "") -> bool:
+        """Cheap To check from one blob (no extra dumps)."""
+        want = (to_email or REPORT_EMAIL).strip().lower()
+        low = (blob or self._adb_screen_blob()).lower()
+        if "%40" in low or "is invalid" in low:
+            return False
+        if want and want in low:
+            return True
+        if want == REPORT_EMAIL.lower():
+            if "hotline.support@lkqbelgium.be" in low:
+                return True
+            if "hotline.support" in low and "lkqbelgium" in low:
+                return True
+            if "lkq support" in low:
+                return True
+        return False
+
+    def _dismiss_invalid_email_dialog(self, blob: str = "") -> bool:
+        """Dismiss Gmail 'address … is invalid' popup if present."""
+        low = (blob or "").lower() or self._adb_screen_blob()
+        if "is invalid" not in low and "%40" not in low:
+            return False
+        self._step("Invalid To dialog — OK")
+        try:
+            adb.find_and_tap_text(self.serial, "OK", timeout=1)
+        except Exception:
+            w, h = self._window_size()
+            self._adb_tap(int(w * 0.62), int(h * 0.58))
+        time.sleep(0.12)
+        return True
 
     def _tap_correct_gmail_suggestion(self, to_email: str) -> bool:
-        """Tap Suggestions row only if it matches the hotline address."""
+        """Tap Suggestions row for hotline only — never yayra / diagnostics / You."""
         want = (to_email or REPORT_EMAIL).strip().lower()
-        local = want.split("@", 1)[0]
+        local = want.split("@", 1)[0].lower()
+        w, h = self._window_size()
+        min_y, max_y = int(h * 0.18), int(h * 0.72)
+        best: Optional[Tuple[int, int, int, str]] = None
         try:
             for el in adb.get_ui_elements(self.serial):
                 raw = (el.get("text") or el.get("content_desc") or "").strip()
                 low = raw.lower()
-                if not low:
+                if not low or "%40" in low:
                     continue
-                # Never tap random suggestions (e.g. yayra.osias)
-                if want in low or (
-                    local in low and ("lkq" in low or "hotline" in low or "belgium" in low)
-                ):
-                    match = re.search(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", el.get("bounds") or "")
-                    if not match:
+                if any(
+                    bad in low
+                    for bad in ("yayra", "osias", "sergoynediag", "diagnostics@")
+                ) and want not in low:
+                    continue
+                if low in {"you", "suggestions", "to", "from", "lkq support"}:
+                    # Prefer the email line, not the name-only label
+                    if "@" not in low:
                         continue
-                    l, t, r, b = (int(match.group(i)) for i in range(1, 5))
-                    self._adb_tap((l + r) // 2, (t + b) // 2)
-                    self._step(f"Tapped matching suggestion: {raw[:60]}")
-                    return True
+                match = re.search(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", el.get("bounds") or "")
+                if not match:
+                    continue
+                l, t, r, b = (int(match.group(i)) for i in range(1, 5))
+                x, y = (l + r) // 2, (t + b) // 2
+                if y < min_y or y > max_y:
+                    continue
+                score = 0
+                if want and want in low:
+                    score = 100
+                elif want == REPORT_EMAIL.lower() and "hotline.support@lkqbelgium.be" in low:
+                    score = 100
+                elif want == REPORT_EMAIL.lower() and "hotline.support" in low and "lkqbelgium" in low:
+                    score = 90
+                elif local and local in low and "@" in low and want.split("@")[-1] in low:
+                    score = 80
+                else:
+                    continue
+                if "@" in low:
+                    score += 10
+                if best is None or score > best[0]:
+                    best = (score, x, y, raw)
+        except Exception:
+            return False
+        if not best:
+            return False
+        _s, x, y, raw = best
+        self._adb_tap(x, y)
+        self._step(f"Tapped hotline suggestion: {raw[:70]}")
+        time.sleep(0.12)
+        return True
+
+    def _commit_gmail_to_with_enter(self) -> None:
+        """Enter commits To — Send arrow turns blue."""
+        try:
+            adb._run_adb(
+                ["-s", self.serial, "shell", "input", "keyevent", "66"],
+                timeout=2,
+            )
         except Exception:
             pass
-        return False
+        time.sleep(0.18)
+
+    def _adb_input(self, *parts: str, timeout: int = 4) -> None:
+        adb._run_adb(["-s", self.serial, "shell", *parts], timeout=timeout)
 
     def _adb_type_email(self, email: str) -> bool:
-        """Type an email address via ADB (escape @). Prefer u2 set_text when available."""
+        """Type the full address in segments so ADB does not truncate or print %40.
+
+        hotline + . + support + @ + lkqbelgium + . + be
+        """
         email = (email or "").strip()
         if not email:
             return False
-        try:
-            device = self.ensure_device()
-            edit = device(className="android.widget.MultiAutoCompleteTextView")
-            if self._u2_rpc(lambda: edit.exists(timeout=0.25), timeout=0.5, default=False):
-                edit.set_text(email)
-                time.sleep(0.2)
-                return True
-        except Exception:
-            pass
+        # Split on . and @ so each `input text` is a simple alnum token
+        tokens: List[str] = []
+        buf = ""
+        for ch in email:
+            if ch in ".@":
+                if buf:
+                    tokens.append(buf)
+                    buf = ""
+                tokens.append(ch)
+            else:
+                buf += ch
+        if buf:
+            tokens.append(buf)
 
-        # ADB input text: @ → %40, space → %s
-        safe = (
-            email.replace("%", "\\%")
-            .replace(" ", "%s")
-            .replace("@", "%40")
-        )
         try:
-            adb._run_adb(
-                ["-s", self.serial, "shell", "input", "text", safe],
-                timeout=5,
-            )
-            time.sleep(0.2)
+            for tok in tokens:
+                if tok == ".":
+                    self._adb_input("input", "keyevent", "56")  # KEYCODE_PERIOD
+                elif tok == "@":
+                    self._adb_input("input", "keyevent", "77")  # KEYCODE_AT
+                else:
+                    self._adb_input("input", "text", tok)
+                time.sleep(0.04)
+            self._step(f"Typed To: {email}")
             return True
         except Exception as exc:
             self._step(f"ADB type email failed: {exc}")
             return False
 
     def _focus_gmail_to_field(self) -> None:
-        """Tap the To recipient field on Gmail compose."""
+        """Tap To field — right of the To label (into the value)."""
         w, h = self._window_size()
-        # Prefer node labeled To / recipient
-        try:
-            for el in adb.get_ui_elements(self.serial):
-                raw = (el.get("text") or el.get("content_desc") or "").strip().lower()
-                rid = (el.get("resource_id") or "").lower()
-                if raw not in {"to", "to:"} and "to" not in rid and "recipient" not in rid:
-                    continue
-                match = re.search(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", el.get("bounds") or "")
-                if not match:
-                    continue
-                l, t, r, b = (int(match.group(i)) for i in range(1, 5))
-                y = (t + b) // 2
-                if y > int(h * 0.35):
-                    continue
-                # Tap right of the "To" label into the value area
-                self._adb_tap(min(int(w * 0.35), (l + r) // 2 + 80), y)
-                time.sleep(0.2)
-                return
-        except Exception:
-            pass
-        self._adb_tap(int(w * 0.28), int(h * 0.16))
-        time.sleep(0.2)
+        self._adb_tap(int(w * 0.32), int(h * 0.16))
+        time.sleep(0.12)
 
     def _clear_gmail_to_field(self) -> None:
-        """Clear existing To chips/text before typing hotline."""
+        """Clear leftover typed text (keep existing LKQ Support chip if possible)."""
         try:
-            # Select-all then delete (KEYCODE_CTRL_A may not exist on all tablets)
-            adb._run_adb(
-                ["-s", self.serial, "shell", "input", "keyevent", "KEYCODE_MOVE_END"],
-                timeout=2,
-            )
-            for _ in range(50):
-                adb._run_adb(
-                    ["-s", self.serial, "shell", "input", "keyevent", "KEYCODE_DEL"],
-                    timeout=2,
-                )
+            # Move to end, delete residual typed chars (not 50 round-trips)
+            self._adb_input("input", "keyevent", "KEYCODE_MOVE_END")
+            for _ in range(12):
+                self._adb_input("input", "keyevent", "67")  # DEL
         except Exception:
             pass
-        time.sleep(0.1)
 
     def _ensure_gmail_recipient(self, to_email: str) -> bool:
-        """Fill To with hotline address. Returns True only when verified on screen.
+        """Fill To fully, pick hotline suggestion or Enter, then ready for Send.
 
-        Never taps wrong Suggestions. Blocks Send when verification fails.
+        If LKQ Support chip is already in To, skip typing (do not tap yayra).
         """
         to_email = (to_email or REPORT_EMAIL).strip() or REPORT_EMAIL
-        if self._gmail_to_is_correct(to_email):
-            self._step(f"Gmail To already correct: {to_email} / LKQ Support")
+        blob = self._adb_screen_blob()
+        self._dismiss_invalid_email_dialog(blob)
+
+        already = self._gmail_to_is_correct_fast(to_email, blob)
+        if already and "%40" not in (blob or "").lower():
+            self._step(f"To already has {to_email} — Enter then Send")
+            self._commit_gmail_to_with_enter()
             return True
 
-        blob = self._adb_screen_blob()
-        if "suggestions" in blob:
-            self._step("Wrong/unrelated Suggestions visible — typing hotline address")
-
-        self._step(f"Filling Gmail To: {to_email}")
-        w, h = self._window_size()
+        self._step(f"Filling To: {to_email}")
         self._focus_gmail_to_field()
-        self._clear_gmail_to_field()
-
+        time.sleep(0.08)
         if not self._adb_type_email(to_email):
-            self._step("Could not type To address")
+            self._commit_gmail_to_with_enter()
             return False
 
         time.sleep(0.35)
-        # Only accept a suggestion that matches hotline — never yayra / random contacts
-        if self._tap_correct_gmail_suggestion(to_email):
-            time.sleep(0.25)
+        # Tap Hotline.support@… suggestion if it appeared; never yayra
+        if not self._tap_correct_gmail_suggestion(to_email):
+            self._commit_gmail_to_with_enter()
         else:
-            # Commit typed address: Enter then tap body to dismiss wrong suggestions
-            try:
-                adb._run_adb(
-                    ["-s", self.serial, "shell", "input", "keyevent", "KEYCODE_ENTER"],
-                    timeout=2,
-                )
-            except Exception:
-                pass
-            self._adb_tap(int(w * 0.50), int(h * 0.48))
-            time.sleep(0.25)
-
-        if self._gmail_to_is_correct(to_email):
-            self._step(f"Gmail To verified: {to_email}")
-            return True
-
-        # Last try: type again without clearing chips that might have partially applied
-        self._step("To not verified — one more fill pass")
-        self._focus_gmail_to_field()
-        self._adb_type_email(to_email)
-        time.sleep(0.3)
-        try:
-            adb._run_adb(
-                ["-s", self.serial, "shell", "input", "keyevent", "KEYCODE_ENTER"],
-                timeout=2,
-            )
-        except Exception:
-            pass
-        self._adb_tap(int(w * 0.50), int(h * 0.48))
-        time.sleep(0.3)
-        ok = self._gmail_to_is_correct(to_email)
-        if ok:
-            self._step(f"Gmail To verified: {to_email}")
-        else:
-            self._step(f"Gmail To still not showing {to_email}")
-        return ok
+            time.sleep(0.12)
+        return True
 
     def _tap_gmail_send(self) -> None:
-        """Tap the blue Send arrow (top-right), never paperclip or ⋮ overflow."""
+        """Tap the blue Send triangle top-right (circled) — not paperclip, not ⋮."""
         w, h = self._window_size()
-        # Prefer accessibility "Send" in the top action bar (y small, x right but left of menu)
+        # Prefer accessibility Send in the top action bar
         try:
             for el in adb.get_ui_elements(self.serial):
                 desc = (el.get("content_desc") or el.get("text") or "").strip().lower()
                 rid = (el.get("resource_id") or "").lower()
-                if desc not in {"send", "send email"} and "gm:id/send" not in rid and not rid.endswith("/send"):
+                if desc not in {"send", "send email"} and not rid.endswith("/send"):
                     continue
                 match = re.search(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", el.get("bounds") or "")
                 if not match:
                     continue
                 l, t, r, b = (int(match.group(i)) for i in range(1, 5))
                 x, y = (l + r) // 2, (t + b) // 2
-                # Top bar only; keep left of far-right overflow (⋮)
-                if y > int(h * 0.18):
+                if y > int(h * 0.16):
                     continue
-                if x < int(w * 0.55) or x > int(w * 0.95):
+                if x < int(w * 0.70) or x > int(w * 0.96):
                     continue
                 self._adb_tap(x, y)
                 self._step(f"Tapped Gmail Send (blue arrow) at ({x},{y})")
                 return
-        except Exception as exc:
-            self._step(f"ADB Send lookup skip: {exc}")
-
-        try:
-            device = self.ensure_device()
-            node = device(description="Send")
-            if self._u2_rpc(lambda: node.exists(timeout=0.12), timeout=0.3, default=False):
-                self._tap_node_center(node)
-                self._step("Tapped Gmail Send (u2 description=Send)")
-                return
-            node = device(resourceId="com.google.android.gm:id/send")
-            if self._u2_rpc(lambda: node.exists(timeout=0.1), timeout=0.28, default=False):
-                self._tap_node_center(node)
-                self._step("Tapped Gmail Send (u2 resourceId)")
-                return
         except Exception:
             pass
 
-        # Layout: blue arrow left of ⋮ (not far-right edge)
+        # Layout: paperclip ~0.82, Send ~0.89, ⋮ ~0.95
         x, y = int(w * POINT_GMAIL_SEND[0]), int(h * POINT_GMAIL_SEND[1])
         self._adb_tap(x, y)
         self._step(f"Tapped Gmail Send (layout blue arrow) at ({x},{y})")
+        time.sleep(0.12)
+        # Nudge slightly if still on compose
+        x2, y2 = int(w * 0.91), int(h * 0.055)
+        if (x2, y2) != (x, y):
+            self._adb_tap(x2, y2)
+
+    def handle_common_dialogs(self, max_rounds: int = 4) -> List[str]:
+        """Dismiss VAG Diagnostic Firewall first, then generic Launch popups."""
+        dismissed: List[str] = []
+        if self.dismiss_diagnostic_firewall():
+            dismissed.append("Diagnostic Firewall OK")
+        try:
+            more = super().handle_common_dialogs(max_rounds=max_rounds)
+            dismissed.extend(more or [])
+        except Exception:
+            pass
+        return dismissed
 
     def dismiss_until_stable(self, rounds: int = 5) -> None:
         for _ in range(rounds):
+            if self.dismiss_diagnostic_firewall():
+                time.sleep(0.35)
+                continue
             hit = self.handle_common_dialogs(max_rounds=2)
             if not hit:
                 break
@@ -2962,63 +3060,157 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
         self._step("Could not open Local Diagnose")
         return False
 
-    def _type_search_text(self, text: str) -> bool:
-        """Focus Local Diagnose search and type ``text`` (ADB — no u2 required)."""
-        return self._type_search_text_fast(text)
-
-    def _type_search_text_fast(self, text: str) -> bool:
-        """Tap Local Diagnose search (top-right) and type via ADB — no slow clear loop."""
+    def _focus_local_diagnose_search(self) -> None:
+        """Tap the Local Diagnose search field (top-right)."""
         w, h = self._window_size()
-        # Prefer ADB bounds for "Enter the model name"
         focused = False
         try:
             for el in adb.get_ui_elements(self.serial):
                 raw = (el.get("text") or el.get("content_desc") or "").strip().lower()
-                if "enter the model" not in raw and "model name" not in raw:
+                rid = (el.get("resource_id") or "").lower()
+                if (
+                    "enter the model" not in raw
+                    and "model name" not in raw
+                    and "search" not in rid
+                    and "edit" not in rid
+                ):
                     continue
                 match = re.search(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", el.get("bounds") or "")
                 if not match:
                     continue
                 l, t, r, b = (int(match.group(i)) for i in range(1, 5))
-                self._adb_tap((l + r) // 2, (t + b) // 2)
+                y = (t + b) // 2
+                if y > int(h * 0.22):
+                    continue
+                self._adb_tap((l + r) // 2, y)
                 focused = True
                 break
         except Exception:
             pass
         if not focused:
             self._adb_tap(int(w * 0.82), int(h * 0.08))
-        time.sleep(0.15)
+        time.sleep(0.12)
 
-        # Clear previous query
+    def _clear_local_diagnose_search(self) -> None:
+        """Always wipe the search bar — leftover brands from prior jobs stay there."""
+        self._step("Clearing Local Diagnose search bar (old brand if saved)", 0.24)
+        w, h = self._window_size()
+        self._focus_local_diagnose_search()
+
+        # Tap the field's trailing X / clear icon if present
         try:
-            adb._run_adb(
-                ["-s", self.serial, "shell", "input", "keyevent", "KEYCODE_MOVE_END"],
-                timeout=2,
-            )
-            for _ in range(24):
-                adb._run_adb(
-                    ["-s", self.serial, "shell", "input", "keyevent", "KEYCODE_DEL"],
-                    timeout=2,
-                )
+            for el in adb.get_ui_elements(self.serial):
+                raw = (el.get("text") or el.get("content_desc") or "").strip().lower()
+                rid = (el.get("resource_id") or "").lower()
+                if not any(k in f"{raw} {rid}" for k in ("clear", "delete", "close")):
+                    continue
+                match = re.search(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", el.get("bounds") or "")
+                if not match:
+                    continue
+                l, t, r, b = (int(match.group(i)) for i in range(1, 5))
+                y = (t + b) // 2
+                if y > int(h * 0.22):
+                    continue
+                self._adb_tap((l + r) // 2, y)
+                time.sleep(0.1)
+                break
         except Exception:
             pass
+        # Trailing X on the search row (top-right)
+        self._adb_tap(int(w * 0.96), int(h * 0.08))
+        time.sleep(0.08)
+        self._focus_local_diagnose_search()
 
+        try:
+            adb._run_adb(
+                [
+                    "-s",
+                    self.serial,
+                    "shell",
+                    "sh",
+                    "-c",
+                    "input keyevent 123; "
+                    "i=0; while [ $i -lt 40 ]; do input keyevent 67; i=$((i+1)); done",
+                ],
+                timeout=5,
+            )
+        except Exception:
+            try:
+                adb._run_adb(
+                    ["-s", self.serial, "shell", "input", "keyevent", "KEYCODE_MOVE_END"],
+                    timeout=2,
+                )
+                for _ in range(20):
+                    adb._run_adb(
+                        ["-s", self.serial, "shell", "input", "keyevent", "67"],
+                        timeout=2,
+                    )
+            except Exception:
+                pass
+        time.sleep(0.12)
+
+    def _type_search_text(self, text: str) -> bool:
+        """Focus Local Diagnose search, clear leftover brand, then type ``text``."""
+        return self._type_search_text_fast(text)
+
+    def _type_search_text_fast(self, text: str) -> bool:
+        """Clear search first, then type the selected brand via ADB."""
+        self._clear_local_diagnose_search()
         safe = re.sub(r"[^A-Za-z0-9 \-_]", "", text).strip()
         if not safe:
             return False
+        self._focus_local_diagnose_search()
         try:
             adb._run_adb(
                 ["-s", self.serial, "shell", "input", "text", safe.replace(" ", "%s")],
                 timeout=3,
             )
-            time.sleep(0.25)
+            time.sleep(0.35)
             return True
         except Exception as exc:
             self._step(f"Search type failed: {exc}")
             return False
 
+    def _confirm_local_brand_ok(self) -> bool:
+        """After tapping the brand icon, confirm with OK if a popup appears."""
+        deadline = time.time() + 4.0
+        while time.time() < deadline:
+            self.raise_if_cancelled()
+            blob = self._adb_screen_blob()
+            if any(
+                k in blob
+                for k in (
+                    "system and function",
+                    "system topology",
+                    "automatically search",
+                    "show menu",
+                    "full system",
+                    "autodetect",
+                )
+            ):
+                return True
+            if "ok" in blob or "continue" in blob or "confirm" in blob:
+                self._step("Brand confirm popup — tapping OK", 0.42)
+                try:
+                    if adb.find_and_tap_text(self.serial, "OK", timeout=2):
+                        time.sleep(0.25)
+                        return True
+                except Exception:
+                    pass
+                try:
+                    if adb.find_and_tap_text(self.serial, "Continue", timeout=1):
+                        time.sleep(0.25)
+                        return True
+                except Exception:
+                    pass
+                self._tap_ok_preferred()
+                time.sleep(0.25)
+                return True
+            time.sleep(0.15)
+        return False
+
     def search_and_select_brand(self, brand: Optional[str] = None) -> Dict[str, object]:
-        """On Local Diagnose: search for brand (e.g. Renault) and tap its tile — ADB-first."""
+        """Clear search → type selected brand → tap brand icon → OK."""
         result: Dict[str, object] = {
             "ok": False,
             "search": None,
@@ -3030,28 +3222,28 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
             terms = [str(brand or self.preferred_brand or "")]
         primary = terms[0]
         result["search"] = primary
-        self._step(f"Local Diagnose search: {primary}", 0.25)
+        self._step(f"Local Diagnose — clear search, then type {primary}", 0.25)
 
         if not self._type_search_text_fast(primary):
             result["error"] = "Could not type into Local Diagnose search bar"
             self._step(result["error"])
             return result
 
-        time.sleep(0.35)
+        time.sleep(0.4)
 
-        # ADB text tap for each candidate label (works without u2)
+        # Tap the filtered brand icon / tile (exact label first)
+        tapped = False
         for label in terms:
             try:
                 if adb.find_and_tap_text(self.serial, label, timeout=3):
                     result.update(ok=True, tapped=label, method="adb_text")
-                    self._step(f"Tapped brand tile (ADB): {label}", 0.4)
-                    time.sleep(0.25)
-                    return result
+                    self._step(f"Tapped brand icon (ADB): {label}", 0.4)
+                    tapped = True
+                    break
             except Exception:
                 continue
 
-        # Optional soft u2 path
-        if not self._u2_failed:
+        if not tapped and not self._u2_failed:
             try:
                 device = self.ensure_device()
                 for label in terms:
@@ -3062,33 +3254,33 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
                     if exists:
                         pt = self._tap_node_center(node)
                         result.update(ok=True, tapped=label, point=pt, method="u2")
-                        self._step(f"Tapped brand tile: {label}", 0.4)
-                        time.sleep(0.2)
-                        return result
+                        self._step(f"Tapped brand icon: {label}", 0.4)
+                        tapped = True
+                        break
             except Exception:
                 self._u2_failed = True
 
-        # Layout: first filtered tile after search (top-left of grid)
-        w, h = self._window_size()
-        for rx, ry in ((0.14, 0.30), (0.18, 0.32), (0.14, 0.38), (0.28, 0.30)):
-            x, y = int(w * rx), int(h * ry)
+        if not tapped:
+            w, h = self._window_size()
+            # First filtered brand icon after search is top-left of the grid
+            x, y = int(w * 0.14), int(h * 0.30)
             self._adb_tap(x, y)
-            self._step(f"Tapped first filtered tile (layout) for {primary} at ({x},{y})", 0.4)
-            time.sleep(0.45)
-            # Leave Local Diagnose search page ⇒ brand opened
-            if not self.is_local_diagnose_page():
-                result.update(ok=True, tapped=primary, method="layout")
-                return result
+            result.update(ok=True, tapped=primary, method="layout")
+            self._step(f"Tapped brand icon (layout) for {primary} at ({x},{y})", 0.4)
+            tapped = True
 
-        result.update(ok=True, tapped=primary, method="layout")
-        self._step(f"Assumed brand tile tap for {primary}", 0.4)
+        time.sleep(0.3)
+        self._confirm_local_brand_ok()
+        result["ok"] = True
+        result["tapped"] = result.get("tapped") or primary
         return result
 
     def continue_after_local_brand(self, timeout: Optional[float] = None) -> str:
-        """After brand tile: wait for Diagnostic, topology, or Renault Show Menu."""
+        """After brand icon + OK: wait for Diagnostic, topology, or Renault Show Menu."""
         if timeout is None:
             timeout = 22.0 if has_renault_auto_search(self.preferred_brand) else 3.5
         deadline = time.time() + timeout
+        ok_taps = 0
         while time.time() < deadline:
             self.raise_if_cancelled()
             if self.is_system_function_page():
@@ -3099,11 +3291,23 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
             if self.autodetect_result_visible():
                 self.tap_diagnostic()
                 return "diagnostic"
-            # Full System via ADB (no u2)
             try:
                 blob = self._adb_screen_blob()
             except Exception:
                 blob = ""
+            if ok_taps < 3 and ("ok" in blob or "continue" in blob):
+                if not any(
+                    k in blob
+                    for k in ("automatically search", "system and function", "gmail")
+                ):
+                    ok_taps += 1
+                    self._step("Tapping OK after Local Diagnose brand", 0.45)
+                    try:
+                        adb.find_and_tap_text(self.serial, "OK", timeout=2)
+                    except Exception:
+                        self._tap_ok_preferred()
+                    time.sleep(0.25)
+                    continue
             if "full system" in blob:
                 try:
                     if adb.find_and_tap_text(self.serial, "Full System", timeout=2):
@@ -3129,7 +3333,7 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
                     return out
 
             self._step(
-                f"Local Diagnose — searching / selecting brand: {self.preferred_brand}",
+                f"Local Diagnose — clear search, type {self.preferred_brand}, tap icon, OK",
                 0.18,
             )
             pick = self.search_and_select_brand(self.preferred_brand)
@@ -3203,7 +3407,12 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
 
         try:
             t0 = time.time()
-            self._step(f"Start auto detection — {self.preferred_brand}", 0.02)
+            who = self.engineer or "—"
+            dest = self.report_email or REPORT_EMAIL
+            self._step(
+                f"Start auto detection — {self.preferred_brand} · engineer={who} · report to {dest}",
+                0.02,
+            )
             if has_full_workflow(self.preferred_brand):
                 self._step("Workflow: VAG full path (AutoDetect → Diagnostic → Topology scan)", 0.03)
             elif has_renault_auto_search(self.preferred_brand):
@@ -3289,6 +3498,7 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
                 self._step("Tapping Diagnostic…", 0.91)
                 diag = self.tap_diagnostic()
                 result["diagnostic_method"] = diag.get("method") or result.get("diagnostic_method")
+            self.dismiss_diagnostic_firewall()
 
             if has_renault_auto_search(self.preferred_brand):
                 self._step(
@@ -3407,6 +3617,7 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
                 scan = {"ok": True, "button": topo.get("scan_button") or "High-speed Scan"}
             else:
                 scan = self.start_topology_ecu_scan()
+            self.dismiss_diagnostic_firewall()
             result["scan_button"] = scan.get("button")
             if not scan.get("ok"):
                 result["error"] = scan.get("error") or "Failed to start ECU scan"
@@ -3430,9 +3641,10 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
                 result["error"] = done.get("error") or "ECU scan did not finish"
                 return result
 
-            mailed = self.send_scan_report_via_gmail(REPORT_EMAIL)
-            result["emailed_to"] = mailed.get("emailed_to") or REPORT_EMAIL
+            mailed = self.send_scan_report_via_gmail()
+            result["emailed_to"] = mailed.get("emailed_to") or self.report_email or REPORT_EMAIL
             result["report_emailed"] = bool(mailed.get("ok"))
+            result["engineer"] = self.engineer
             if not mailed.get("ok"):
                 result["error"] = mailed.get("error") or "Failed to email X431 report"
                 return result
@@ -3441,14 +3653,16 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
                 self.serial,
                 "vag_inspection_report_email",
                 "completed",
-                f"vin={vin or 'UNKNOWN'}; make={make}; model={model}; to={REPORT_EMAIL}",
+                f"vin={vin or 'UNKNOWN'}; make={make}; model={model}; "
+                f"engineer={self.engineer or '—'}; to={result['emailed_to']}",
                 None,
             )
 
             elapsed = round(time.time() - t0, 2)
             result["ok"] = True
             self._step(
-                f"Full scan + report emailed to {REPORT_EMAIL} · total {elapsed}s",
+                f"Full scan + report emailed to {result['emailed_to']} "
+                f"· engineer={self.engineer or '—'} · total {elapsed}s",
                 1.0,
             )
         except Exception as exc:

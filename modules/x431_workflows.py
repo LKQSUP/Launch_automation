@@ -13,7 +13,8 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence
 
 from modules import adb_controller as adb
-from modules.db import ensure_database, save_dtc, save_report
+from modules.db import ensure_database, save_dtc, save_report, set_operator_context
+from modules.engineer_session import DEFAULT_REPORT_EMAIL, normalize_report_email
 from modules.local_ocr_vision import LocalVisionEngine
 
 logger = logging.getLogger(__name__)
@@ -76,6 +77,8 @@ class LaunchX431WorkflowEngine:
         serial: str,
         callback: Optional[ProgressCallback] = None,
         vision: Optional[LocalVisionEngine] = None,
+        engineer: str = "",
+        report_email: str = "",
     ) -> None:
         """Bind the engine to an ADB serial and optional progress callback.
 
@@ -83,13 +86,18 @@ class LaunchX431WorkflowEngine:
             serial: Target device serial.
             callback: Optional ``(message, progress)`` stream for Streamlit.
             vision: Optional shared :class:`LocalVisionEngine` instance.
+            engineer: Toolbox login / operator name stored on every scan row.
+            report_email: Gmail To: address (empty → hotline.support@lkqbelgium.be).
         """
         self.serial = serial
         self.callback = callback
         self.vision = vision or LocalVisionEngine()
         self.device = None
         self.logs: List[str] = []
+        self.engineer = (engineer or "").strip()
+        self.report_email = normalize_report_email(report_email)
         ensure_database()
+        set_operator_context(self.engineer, self.report_email)
 
     # ------------------------------------------------------------------ helpers
 
@@ -99,7 +107,12 @@ class LaunchX431WorkflowEngine:
 
     def device_stamp(self) -> Dict[str, str]:
         """Identity fields to attach to run results / persistence."""
-        return {"serial": self.serial, "device_label": self.device_label()}
+        return {
+            "serial": self.serial,
+            "device_label": self.device_label(),
+            "engineer": self.engineer or "",
+            "report_email": self.report_email or DEFAULT_REPORT_EMAIL,
+        }
 
     def _step(self, message: str, progress: Optional[float] = None) -> None:
         self.logs.append(message)
