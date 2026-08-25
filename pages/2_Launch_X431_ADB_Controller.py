@@ -1,4 +1,4 @@
-"""Launch X431 — auto detection + VIN audit (multi-brand platform; VAG workflows first).
+"""Launch X431 full automated workflow .
 
 Flow: Sync → choose brand → Intelligent Diagnose → wait processing →
 AutoDetect Result → read VIN/Make → save for audit.
@@ -70,7 +70,7 @@ if devices or "last_adb_devices" not in st.session_state:
 st.subheader("1. Sync tablet")
 c_sync, c_dev = st.columns([1, 3])
 with c_sync:
-    if st.button("Sync ADB", type="primary", use_container_width=True):
+    if st.button("Sync ADB", type="primary", width="stretch"):
         result = sync_adb_devices()
         st.session_state["last_adb_devices"] = result.get("devices") or []
         if result.get("devices"):
@@ -116,7 +116,7 @@ with c_dev:
         st.button(
             "Save label",
             on_click=_save_adb_device_label,
-            use_container_width=True,
+            width="stretch",
         )
         if saved_label := st.session_state.pop("adb_label_just_saved", None):
             st.success(f"Saved label: `{saved_label}`")
@@ -153,14 +153,14 @@ with w1:
 with w2:
     do_switch = st.button(
         "Switch USB → Wi-Fi",
-        use_container_width=True,
+        width="stretch",
         disabled=not serial or is_wifi_serial(serial),
         help="Uses the selected USB device: enable TCP/IP, then connect over Wi-Fi.",
     )
 with w3:
-    do_wifi_connect = st.button("Connect Wi-Fi", type="primary", use_container_width=True)
+    do_wifi_connect = st.button("Connect Wi-Fi", type="primary", width="stretch")
 with w4:
-    do_wifi_disconnect = st.button("Disconnect Wi-Fi", use_container_width=True)
+    do_wifi_disconnect = st.button("Disconnect Wi-Fi", width="stretch")
 
 if do_switch and serial:
     with st.spinner("Switching selected USB tablet to Wi-Fi ADB…"):
@@ -421,24 +421,24 @@ with run_col:
     start = st.button(
         "Start auto detection",
         type="primary",
-        use_container_width=True,
+        width="stretch",
         disabled=bool(ctl.get("running")) or not bool(engineer),
     )
 with stop_col:
     stop = st.button(
         "Stop",
-        use_container_width=True,
+        width="stretch",
         disabled=not bool(ctl.get("running")),
         help="Request cancel of the current auto-detect thread.",
     )
 with reset_col:
     hard_reset = st.button(
         "Hard Reset",
-        use_container_width=True,
+        width="stretch",
         help="Force-stop EURO LINK, clear stuck u2 helpers, relaunch home. Use after Stop or a frozen run.",
     )
 with open_col:
-    if st.button("Only open EURO LINK", use_container_width=True):
+    if st.button("Only open EURO LINK", width="stretch"):
         try:
             st.success(launch_x431(serial))
         except Exception as exc:
@@ -449,7 +449,7 @@ if has_fca_oil_reset(brand):
     start_fca_oil = st.button(
         "Start Oil Maintenance Reset (FCA / SGW)",
         type="primary",
-        use_container_width=True,
+        width="stretch",
         disabled=bool(ctl.get("running")) or not bool(engineer),
         help="Fiat 500e-style: Diagnostic → OK confirm → SGW OK → Common Special Function → Oil reset → home.",
     )
@@ -728,14 +728,14 @@ act_report, act_clear = st.columns(2)
 with act_report:
     do_report = st.button(
         "Report",
-        use_container_width=True,
+        width="stretch",
         disabled=bool(ctl.get("running")) or not bool(serial) or not bool(engineer),
         help="Must be on System and Function / Topology. Runs Report → email → Back.",
     )
 with act_clear:
     do_clear = st.button(
         "Clear All DTCs",
-        use_container_width=True,
+        width="stretch",
         disabled=bool(ctl.get("running")) or not bool(serial),
         help="Must be on System and Function / Topology. Taps Clear All DTCs bottom-right.",
     )
@@ -849,6 +849,6 @@ try:
     if audit.empty:
         st.info("No VIN audit rows yet — run auto detection once.")
     else:
-        st.dataframe(audit, use_container_width=True)
+        st.dataframe(audit, width="stretch")
 except Exception as exc:
     st.warning(f"Could not load audit table: {exc}")

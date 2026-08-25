@@ -8,8 +8,8 @@ st.set_page_config(page_title="Live Ticket Monitor", layout="wide")
 st.title("Live Ticket Monitor")
 
 st.markdown(
-    "Monitor incoming connected cars from Jifeline and follow automation progress in real time. "
-    "Only real device / workflow events are shown — no mock data."
+    " Monitor live automation progress in real time. "
+   
 )
 
 if st.button("Refresh"):
@@ -45,4 +45,4 @@ history = ticket_history(limit=50)
 if history.empty:
     st.info("No ticket history yet.")
 else:
-    st.dataframe(history, use_container_width=True)
+    st.dataframe(history, width="stretch")
