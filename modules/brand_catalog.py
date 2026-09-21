@@ -2,6 +2,7 @@
 
 Full diagnostic workflows are implemented for VAG first; other brands share the
 same Intelligent Diagnose → AutoDetect Result entry path on EURO LINK.
+Renault/Dacia and Toyota/Lexus also advance via their Show Menu Automatic(ally) Search tiles.
 """
 
 from __future__ import annotations
@@ -20,6 +21,9 @@ FCA_OIL_RESET: frozenset[str] = frozenset(
 
 # After Diagnostic: Show Menu → Automatically Search → YES → YES → tap model.
 RENAULT_AUTO_SEARCH: frozenset[str] = frozenset({"Renault", "Dacia"})
+
+# After Diagnostic: Show Menu → Automatic Search (Europe and Other) → Topology.
+TOYOTA_AUTO_SEARCH: frozenset[str] = frozenset({"Toyota", "Lexus"})
 
 # UI brand groups (manufacturer families on EURO LINK).
 BRAND_GROUPS: Dict[str, Tuple[str, ...]] = {
@@ -198,6 +202,10 @@ def has_fca_oil_reset(brand: str) -> bool:
 
 def has_renault_auto_search(brand: str) -> bool:
     return brand.strip() in RENAULT_AUTO_SEARCH
+
+
+def has_toyota_auto_search(brand: str) -> bool:
+    return brand.strip() in TOYOTA_AUTO_SEARCH
 
 
 def local_diagnose_search_terms(brand: str) -> Sequence[str]:

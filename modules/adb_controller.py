@@ -488,6 +488,54 @@ def tap(serial: str, x: int, y: int) -> str:
         raise RuntimeError(f"Failed to tap: {exc}") from exc
 
 
+def keyevent(serial: str, key: str | int) -> str:
+    """Send an Android keyevent (name like KEYCODE_BACK or numeric code)."""
+    serial = (serial or "").strip()
+    code = str(key).strip()
+    if not code.upper().startswith("KEYCODE_") and not code.isdigit():
+        code = f"KEYCODE_{code.upper()}"
+    try:
+        _run_adb(["-s", serial, "shell", "input", "keyevent", code], timeout=5)
+        return f"Keyevent {code} sent"
+    except Exception as exc:
+        raise RuntimeError(f"Failed keyevent: {exc}") from exc
+
+
+def get_screen_size(serial: str) -> Tuple[int, int]:
+    """Return (width, height) from ``wm size``, or (1280, 800) fallback."""
+    try:
+        proc = _run_adb(["-s", serial, "shell", "wm", "size"], timeout=5)
+        text = (proc.stdout or "") + (proc.stderr or "")
+        # Prefer Override size if present.
+        match = re.search(r"Override size:\s*(\d+)x(\d+)", text, re.I)
+        if not match:
+            match = re.search(r"Physical size:\s*(\d+)x(\d+)", text, re.I)
+        if match:
+            return int(match.group(1)), int(match.group(2))
+    except Exception as exc:
+        logger.warning("wm size failed: %s", exc)
+    return 1280, 800
+
+
+def tap_ratio(serial: str, rx: float, ry: float) -> str:
+    """Tap at relative screen position (0–1 each axis)."""
+    w, h = get_screen_size(serial)
+    x = max(0, min(w - 1, int(float(rx) * w)))
+    y = max(0, min(h - 1, int(float(ry) * h)))
+    return tap(serial, x, y)
+
+
+def input_text(serial: str, text: str) -> str:
+    """Type text via ``adb shell input text`` (spaces as %s)."""
+    serial = (serial or "").strip()
+    safe = (text or "").replace(" ", "%s").replace("'", "\\'")
+    try:
+        _run_adb(["-s", serial, "shell", "input", "text", safe], timeout=8)
+        return "Text sent"
+    except Exception as exc:
+        raise RuntimeError(f"Failed to type text: {exc}") from exc
+
+
 def launch_app(serial: str, package: str, activity: Optional[str] = None) -> str:
     """Launch an Android app by package (and optional activity)."""
     try:

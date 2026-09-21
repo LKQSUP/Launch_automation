@@ -133,8 +133,10 @@ VAG_BRANDS: Sequence[str] = (
 # Extended catalog lives in brand_catalog; VAG entries kept for compatibility.
 from modules.brand_catalog import (
     LOCAL_DIAGNOSE_SEARCH,
+    has_fca_oil_reset,
     has_full_workflow,
     has_renault_auto_search,
+    has_toyota_auto_search,
     local_diagnose_search_terms,
 )
 
@@ -1098,9 +1100,7 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
                 if self._blob_is_autodetect(blob):
                     self._step("AutoDetect Result confirmed (ADB dump)", 0.84)
                     return self._advance_from_autodetect(info)
-                if "enter the model name" in blob or (
-                    "vinscan" in blob and "intelligent diagnose" not in blob
-                ):
+                if self._blob_is_local_diagnose(blob):
                     info["saw_local_diagnose"] = True
                     info["error"] = "AutoDetect not shown — Local Diagnose visible, switching now"
                     self._step(info["error"], 0.35)
@@ -1124,17 +1124,17 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
             if now - last_heartbeat >= 5:
                 self._step(
                     f"Still waiting for AutoDetect… {remaining}s left "
-                    f"(will use Local Diagnose + {self.preferred_brand} if needed)",
+                    f"(will continue on Local Diagnose + {self.preferred_brand} if it opens)",
                     0.7,
                 )
                 last_heartbeat = now
             time.sleep(0.12)
 
-        # Timed out — signal Local Diagnose fallback (caller will open it if needed)
+        # Timed out — tablet typically opens Local Diagnose by itself. Do not go home.
         info["saw_local_diagnose"] = True
         info["error"] = (
             f"AutoDetect Result not reached after {int(timeout)}s — "
-            f"falling back to Local Diagnose ({self.preferred_brand})"
+            f"continuing on Local Diagnose ({self.preferred_brand})"
         )
         self._step(info["error"], 0.35)
         return info
@@ -1706,6 +1706,155 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
         self._step(info["error"])
         return info
 
+    # ------------------------------------------------------------------ Toyota / Lexus
+
+    def is_toyota_show_menu(self, blob: str = "") -> bool:
+        """True on Toyota/Lexus Show Menu (Automatic Search + Manual Select grid)."""
+        if blob:
+            low = blob.lower()
+            # Prefer "automatic search" (Toyota) over Renault's "automatically search".
+            if "automatic search" in low and "automatically search" not in low:
+                if any(
+                    k in low
+                    for k in (
+                        "manual select",
+                        "set area",
+                        "diagnostic history",
+                        "menu help",
+                        "show menu",
+                    )
+                ):
+                    return True
+        if self._u2_has_text("Automatic Search (Europe and Other)", timeout=0.08):
+            return True
+        if self._u2_has_text("Automatic Search", timeout=0.08) and (
+            self._u2_has_text("Manual Select", timeout=0.05)
+            or self._u2_has_text("Set Area", timeout=0.05)
+            or self._u2_has_text("Diagnostic History", timeout=0.05)
+        ):
+            return True
+        # Avoid Renault wording
+        if self._u2_has_text("Automatically Search", timeout=0.05):
+            return False
+        return False
+
+    def tap_toyota_automatic_search(self) -> bool:
+        """Tap Automatic Search (Europe and Other) on Toyota/Lexus Show Menu."""
+        labels = (
+            "Automatic Search (Europe and Other)",
+            "Automatic Search",
+        )
+        for label in labels:
+            if self._tap_u2_text(label, contains=False):
+                self._step(f"Tapped {label} (text)", 0.885)
+                return True
+            try:
+                if adb.find_and_tap_text(self.serial, label, timeout=2):
+                    self._step(f"Tapped {label} (ADB text)", 0.885)
+                    return True
+            except Exception as exc:
+                self._step(f"ADB {label} skip: {exc}")
+
+        # Contains match for truncated / wrapped tile text.
+        if self._tap_u2_text("Automatic Search", contains=True):
+            self._step("Tapped Automatic Search (contains)", 0.885)
+            return True
+
+        xml = self._ui_xml(timeout=1.4)
+        hit = self._tap_label_from_xml(
+            xml,
+            ("Automatic Search (Europe and Other)", "Automatic Search", "Europe and Other"),
+            min_y_ratio=0.16,
+            max_x_ratio=0.55,
+        )
+        if hit:
+            self._step(f"Tapped Automatic Search at ({hit[1]},{hit[2]})", 0.885)
+            return True
+
+        # Top-left tile on the Show Menu grid (matches tablet layout).
+        w, h = self._window_size()
+        x, y = int(w * 0.28), int(h * 0.38)
+        self._adb_tap(x, y)
+        self._step(f"Tapped Automatic Search (top-left tile) at ({x},{y})", 0.885)
+        return True
+
+    def advance_toyota_after_diagnostic(self, timeout: float = 90.0) -> Dict[str, object]:
+        """After Diagnostic: wait Show Menu → tap Automatic Search → hand off to Topology."""
+        info: Dict[str, object] = {"ok": False, "tapped": False, "error": None}
+        deadline = time.time() + timeout
+        last_hb = 0.0
+        tapped = False
+        self._step(
+            "Toyota/Lexus — waiting for Show Menu → Automatic Search (Europe and Other)",
+            0.87,
+        )
+
+        while time.time() < deadline:
+            self.raise_if_cancelled()
+            now = time.time()
+            remaining = int(deadline - now)
+
+            if self.dismiss_diagnostic_firewall():
+                continue
+
+            if self.is_system_function_page():
+                info["ok"] = True
+                if tapped:
+                    self._step("Topology reached after Automatic Search", 0.92)
+                else:
+                    self._step("Already on Topology — Automatic Search not needed", 0.92)
+                return info
+
+            try:
+                blob = " ".join(self._adb_ui_texts())
+            except Exception:
+                blob = ""
+
+            on_menu = self.is_toyota_show_menu(blob)
+            if on_menu and not tapped:
+                self._step("Show Menu — tapping Automatic Search (Europe and Other)", 0.88)
+                self.tap_toyota_automatic_search()
+                tapped = True
+                info["tapped"] = True
+                time.sleep(0.8)
+                continue
+
+            if tapped and not on_menu:
+                # Left Show Menu; Topology / processing may follow.
+                info["ok"] = True
+                self._step(
+                    "Automatic Search tapped — continuing toward Topology",
+                    0.90,
+                )
+                return info
+
+            if now - last_hb >= 4:
+                if tapped:
+                    self._step(
+                        f"Waiting after Automatic Search… {remaining}s left",
+                        0.89,
+                    )
+                else:
+                    self._step(
+                        f"Waiting for Toyota Show Menu… {remaining}s left",
+                        0.88,
+                    )
+                last_hb = now
+            time.sleep(0.2)
+
+        if tapped:
+            info["ok"] = True
+            self._step(
+                "Automatic Search tapped — Topology wait continues next",
+                0.90,
+            )
+            return info
+        info["error"] = (
+            "Toyota/Lexus Show Menu / Automatic Search not reached after Diagnostic"
+        )
+        self._step(info["error"])
+        return info
+
     def is_system_function_page(self) -> bool:
         """True on System and Function / Topology (High-speed Scan or Smart Detection)."""
         # Firewall warning sits in front of Topology — do not treat it as the scan page
@@ -1734,11 +1883,61 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
             return True
         return False
 
+    def _is_fca_vehicle_id_popup(self, blob: str = "") -> bool:
+        """Fiat/Stellantis vehicle ID modal after Diagnostic (CANCEL/OK)."""
+        low = (blob or "").lower()
+        if not low:
+            try:
+                low = " ".join(self._adb_ui_texts()).lower()
+            except Exception:
+                low = ""
+        if not low:
+            return False
+        markers = (
+            "model name",
+            "please record",
+            "identified wrong vehicle",
+            "car code",
+            "body name",
+            "model description",
+        )
+        if "cancel" not in low:
+            return False
+        if any(m in low for m in markers):
+            return True
+        if "vin" in low and "model" in low and ("fiat" in low or "jeep" in low):
+            return True
+        return False
+
+    def _is_fca_reading_wait(self, blob: str = "") -> bool:
+        """Please Wait… reading after Fiat OK (not SGW unlock)."""
+        low = (blob or "").lower()
+        if "secure gateway" in low:
+            return False
+        return "please wait" in low
+
+    def _fca_sgw_result_from_blob(self, blob: str) -> Optional[str]:
+        low = (blob or "").lower()
+        if "unlocked successfully" in low or "secure gateway unlocked" in low:
+            return "success"
+        if any(
+            m in low
+            for m in (
+                "unlock failed",
+                "unlocked failed",
+                "unlock unsuccessful",
+                "failed to unlock",
+                "unable to unlock",
+            )
+        ):
+            return "failed"
+        return None
+
     def wait_system_topology(self, timeout: float = 45.0) -> Dict[str, object]:
         """Poll until System and Function, then tap High-speed Scan or Smart Detection.
 
-        No long idle wait — constantly check the screen and continue as soon as
-        Topology is visible.
+        For Fiat/FCA: after Diagnostic wait for vehicle ID → OK → Please Wait reading
+        → (SGW Success/Fail OK if shown) → Topology.
         """
         info: Dict[str, object] = {
             "ok": False,
@@ -1753,13 +1952,24 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
             "saw_local_diagnose": False,
             "error": None,
         }
+        # FCA cars need longer: Fiat ID + reading (+ optional SGW) before Topology.
+        if has_fca_oil_reset(self.preferred_brand):
+            timeout = max(float(timeout), 240.0)
         deadline = time.time() + timeout
         last_heartbeat = 0.0
         last_adb = 0.0
         diag_retaps = 0
         select_make_taps = 0
         renault_tried = False
-        self._step("Checking for System Topology / System and Function…", 0.93)
+        toyota_tried = False
+        fiat_ok_tapped = False
+        sgw_ok_tapped = False
+        screen_blob = ""
+        self._step(
+            "Checking for System Topology / System and Function "
+            "(Fiat ID OK → reading if shown)…",
+            0.93,
+        )
 
         while time.time() < deadline:
             self.raise_if_cancelled()
@@ -1770,22 +1980,21 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
                 last_adb = 0.0
                 continue
 
-            on_topo = self.is_system_function_page()
-            if not on_topo and now - last_adb >= 1.0:
+            if now - last_adb >= 0.7:
                 last_adb = now
                 try:
-                    blob = " ".join(self._adb_ui_texts()).lower()
+                    screen_blob = " ".join(self._adb_ui_texts()).lower()
                 except Exception:
-                    blob = ""
+                    screen_blob = ""
+
+            on_topo = self.is_system_function_page()
+            if not on_topo and screen_blob:
                 on_topo = bool(
-                    blob
-                    and (
-                        "system and function" in blob
-                        or "system topology" in blob
-                        or "high-speed scan" in blob
-                        or "smart detection" in blob
-                        or ("support sliding" in blob and "vin" in blob)
-                    )
+                    "system and function" in screen_blob
+                    or "system topology" in screen_blob
+                    or "high-speed scan" in screen_blob
+                    or "smart detection" in screen_blob
+                    or ("support sliding" in screen_blob and "vin" in screen_blob)
                 )
 
             if on_topo:
@@ -1835,6 +2044,58 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
                 info["scan_button"] = scan.get("button")
                 return info
 
+            # Fiat/FCA: vehicle ID (pic1) → OK → Please Wait reading (pic2) → Topology / SGW
+            if not fiat_ok_tapped and self._is_fca_vehicle_id_popup(screen_blob):
+                self._step("Fiat vehicle ID popup — tapping OK", 0.91)
+                self._tap_ok_preferred()
+                fiat_ok_tapped = True
+                deadline = max(deadline, time.time() + 180.0)
+                time.sleep(0.5)
+                last_adb = 0.0
+                continue
+
+            sgw_result = self._fca_sgw_result_from_blob(screen_blob)
+            if sgw_result and not sgw_ok_tapped:
+                label = (
+                    "Secure Gateway Unlocked Successfully"
+                    if sgw_result == "success"
+                    else "Secure Gateway Unlock Failed"
+                )
+                self._step(f"{label} — tapping OK", 0.92)
+                self._tap_ok_preferred()
+                sgw_ok_tapped = True
+                deadline = max(deadline, time.time() + 90.0)
+                time.sleep(0.55)
+                last_adb = 0.0
+                continue
+
+            if fiat_ok_tapped and self._is_fca_reading_wait(screen_blob):
+                deadline = max(deadline, time.time() + 90.0)
+                if now - last_heartbeat >= 5:
+                    self._step(
+                        f"Reading vehicle (Please Wait…)… {remaining}s left — next Topology or SGW",
+                        0.92,
+                    )
+                    last_heartbeat = now
+                time.sleep(0.3)
+                continue
+
+            if (
+                fiat_ok_tapped
+                and not sgw_ok_tapped
+                and "secure gateway" in screen_blob
+                and "unlocked successfully" not in screen_blob
+            ):
+                deadline = max(deadline, time.time() + 120.0)
+                if now - last_heartbeat >= 6:
+                    self._step(
+                        f"SGW unlocking… waiting for Success/Fail ({remaining}s left)",
+                        0.92,
+                    )
+                    last_heartbeat = now
+                time.sleep(0.35)
+                continue
+
             if not renault_tried and (
                 self.is_renault_show_menu()
                 or self._renault_yes_no_popup()
@@ -1854,6 +2115,20 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
                 last_adb = 0.0
                 continue
 
+            if (
+                not toyota_tried
+                and has_toyota_auto_search(self.preferred_brand)
+                and self.is_toyota_show_menu()
+            ):
+                adv = self.advance_toyota_after_diagnostic(timeout=90)
+                toyota_tried = True
+                if not adv.get("ok") and adv.get("error"):
+                    info["error"] = adv["error"]
+                    return info
+                deadline = max(deadline, time.time() + 30)
+                last_adb = 0.0
+                continue
+
             if select_make_taps < 2 and self.is_select_make_dialog():
                 self.handle_select_make_dialog()
                 select_make_taps += 1
@@ -1864,12 +2139,25 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
                 info["error"] = "Bounced to Local Diagnose — switching to brand select"
                 self._step(info["error"], 0.36)
                 return info
-            if diag_retaps < 2 and self.autodetect_result_visible():
+            # Do not retap Diagnostic while Fiat ID / reading / SGW is on screen
+            if (
+                diag_retaps < 2
+                and not fiat_ok_tapped
+                and not self._is_fca_vehicle_id_popup(screen_blob)
+                and self.autodetect_result_visible()
+            ):
                 self._step("Still on AutoDetect Result — tapping Diagnostic again", 0.91)
                 self.tap_diagnostic()
                 diag_retaps += 1
             if now - last_heartbeat >= 4:
-                self._step(f"Checking for Topology page… {remaining}s left", 0.93)
+                hint = "Topology"
+                if self._is_fca_vehicle_id_popup(screen_blob):
+                    hint = "Fiat vehicle ID"
+                elif self._is_fca_reading_wait(screen_blob):
+                    hint = "Please Wait / reading"
+                elif "secure gateway" in screen_blob:
+                    hint = "SGW"
+                self._step(f"Waiting for {hint}… {remaining}s left", 0.93)
                 last_heartbeat = now
             time.sleep(0.15)
 
@@ -2475,11 +2763,11 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
             return out
         time.sleep(0.25)
 
-        # ── 6) Compose + Send (fast path) ──────────────────────────
+        # ── 6) Compose + To + Send (must leave compose before success) ──
         self._step("Step 6/7 — Gmail compose → To → Send", 0.996)
-        if not self._wait_gmail_compose(timeout=6):
+        if not self._wait_gmail_compose(timeout=14):
             blob = self._adb_screen_blob()
-            if "diagnostic report" not in blob and "gmail" not in blob and "@" not in blob:
+            if not self._gmail_compose_visible(blob):
                 out["error"] = "Step 6 failed: Gmail compose screen did not open"
                 self._step(out["error"])
                 return out
@@ -2495,27 +2783,36 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
 
         to_email = dest
         out["emailed_to"] = to_email
-        self._step(f"Step 6b — Fill To + Send: {to_email}", 0.996)
-        self._ensure_gmail_recipient(to_email)
-        # Always Send after fill — do not abort on To-verify (chip/dump can lag)
-        self._step("Tapping Gmail Send (blue arrow, top-right)", 0.997)
-        self._tap_gmail_send()
-        time.sleep(0.35)
-
-        # ── 7) Back to Topology ────────────────────────────────────
-        self._step("Step 7/7 — Back to System and Function / Topology", 0.998)
-        if not self.return_to_system_topology_after_email(timeout=18):
-            out["error"] = (
-                "Report emailed but could not confirm return to System and Function / Topology"
-            )
+        self._step(f"Step 6b — Fill To: {to_email}", 0.996)
+        filled = self._ensure_gmail_recipient(to_email)
+        if not filled:
+            self._step("To not confirmed — retrying once")
+            filled = self._ensure_gmail_recipient(to_email)
+        blob = self._adb_screen_blob()
+        self._dismiss_invalid_email_dialog(blob)
+        if blob and not self._gmail_to_is_correct_fast(to_email, blob):
+            out["error"] = f"Gmail To field does not show {to_email} — not sending"
             self._step(out["error"])
-            out["ok"] = True
-            out["returned_to_topology"] = False
             return out
 
+        self._gmail_dismiss_overlays()
+        if not self._gmail_send_and_confirm(to_email, timeout=24.0):
+            out["error"] = "Gmail Send did not complete — tablet still on compose"
+            self._step(out["error"])
+            return out
+
+        # ── 7) Back to Topology (only after send is confirmed) ─────
+        self._step("Step 7/7 — Back to System and Function / Topology", 0.998)
+        back = self.return_to_system_topology_after_email(timeout=22)
+        out["returned_to_topology"] = bool(back)
         out["ok"] = True
-        out["returned_to_topology"] = True
-        self._step(f"Report emailed to {to_email} — back on Topology", 1.0)
+        if back:
+            self._step(f"Report emailed to {to_email} — back on Topology", 1.0)
+        else:
+            self._step(
+                f"Report emailed to {to_email} — leave Inspection Report with tablet Back if needed",
+                1.0,
+            )
         return out
 
     def _tap_ok_preferred(self) -> bool:
@@ -2576,10 +2873,13 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
             blob = self._adb_screen_blob()
             if "x431 inspection report" in blob or "other share" in blob:
                 break
-            if "gmail" in blob or "compose" in blob or "diagnostic report" in blob:
-                self._step("Still in Gmail — tapping Back to Inspection Report")
+            if self._gmail_compose_visible(blob):
+                self._step("Still in Gmail compose — send not confirmed, not backing out of draft")
+                return False
+            if "inbox" in blob or "conversation" in blob or "gmail" in blob:
+                self._step("Gmail after send — tapping Back toward Inspection Report")
                 self.press_android_back()
-                time.sleep(0.5)
+                time.sleep(0.55)
                 continue
             time.sleep(0.2)
 
@@ -2655,19 +2955,106 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
         self._step("Clear All DTCs tapped", 1.0)
         return out
 
-    def _wait_gmail_compose(self, timeout: float = 6.0) -> bool:
-        """Fast compose detect — ADB blob first (u2 often unavailable)."""
+    def _gmail_compose_visible(self, blob: str = "") -> bool:
+        """True while Gmail compose (draft) is on screen — not Inspection Report / Topology."""
+        low = (blob or self._adb_screen_blob()).lower()
+        if not low:
+            return False
+        if "x431 inspection report" in low or "other share" in low:
+            return False
+        if "system and function" in low or "system topology" in low:
+            return False
+        if "clear all dtcs" in low and "report" in low and "diagnostic report" not in low:
+            return False
+        if any(x in low for x in ("reply all", "reply-all", "inbox", "primary", "archive")):
+            return False
+        if "is invalid" in low:
+            return True
+        if "diagnostic report" in low:
+            return True
+        if "compose" in low:
+            return True
+        if "gmail" in low and "to" in low and ("from" in low or "subject" in low):
+            return True
+        if "send" in low and "@" in low and "inbox" not in low:
+            return True
+        return False
+
+    def _gmail_left_compose(self, blob: str = "") -> bool:
+        """True when compose is gone after a successful send (report, topology, or inbox)."""
+        low = (blob or self._adb_screen_blob()).lower()
+        if not low:
+            return False
+        if self._gmail_compose_visible(low):
+            return False
+        if "x431 inspection report" in low or "other share" in low:
+            return True
+        if "system and function" in low or "system topology" in low:
+            return True
+        if "clear all dtcs" in low and "report" in low:
+            return True
+        if any(x in low for x in ("inbox", "primary", "reply all", "archive")):
+            return True
+        return False
+
+    def _gmail_dismiss_overlays(self) -> None:
+        """Close suggestion list / IME so the Send arrow is tappable."""
+        w, h = self._window_size()
+        self._adb_tap(int(w * 0.50), int(h * 0.40))
+        time.sleep(0.2)
+        try:
+            self._adb_input("input", "keyevent", "111")  # KEYCODE_ESCAPE
+        except Exception:
+            pass
+        time.sleep(0.12)
+
+    def _gmail_send_and_confirm(self, to_email: str, timeout: float = 24.0) -> bool:
+        """Tap Send and wait until compose actually closes. Retry if it stays open."""
+        self._step("Tapping Gmail Send — waiting until compose closes", 0.997)
+        self._tap_gmail_send()
+        send_taps = 1
+        deadline = time.time() + timeout
+        last_tap = time.time()
+        while time.time() < deadline:
+            self.raise_if_cancelled()
+            blob = self._adb_screen_blob()
+            if self._dismiss_invalid_email_dialog(blob):
+                self._ensure_gmail_recipient(to_email)
+                self._gmail_dismiss_overlays()
+                self._tap_gmail_send()
+                send_taps += 1
+                last_tap = time.time()
+                time.sleep(1.0)
+                continue
+            if self._gmail_left_compose(blob):
+                self._step("Gmail compose closed — send confirmed", 0.997)
+                return True
+            still = self._gmail_compose_visible(blob)
+            if send_taps < 5 and (time.time() - last_tap) >= 1.6 and (still or not blob):
+                self._step(f"Still on compose — Send retry {send_taps + 1}/5")
+                self._gmail_dismiss_overlays()
+                self._tap_gmail_send()
+                send_taps += 1
+                last_tap = time.time()
+            time.sleep(0.45)
+        blob = self._adb_screen_blob()
+        if self._gmail_left_compose(blob):
+            self._step("Gmail compose closed — send confirmed", 0.997)
+            return True
+        self._step("Gmail still on compose after Send retries — not marking emailed")
+        return False
+
+    def _wait_gmail_compose(self, timeout: float = 14.0) -> bool:
+        """Wait until Gmail compose is actually on screen."""
         deadline = time.time() + timeout
         while time.time() < deadline:
             self.raise_if_cancelled()
             if self._u2_has_text("Diagnostic Report", timeout=0.04):
                 return True
             blob = self._adb_screen_blob()
-            if "diagnostic report" in blob or ("from" in blob and "to" in blob):
+            if self._gmail_compose_visible(blob):
                 return True
-            if "send" in blob and "@" in blob:
-                return True
-            time.sleep(0.12)
+            time.sleep(0.2)
         return False
 
     def _gmail_to_is_correct_fast(self, to_email: str, blob: str = "") -> bool:
@@ -2823,69 +3210,81 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
             pass
 
     def _ensure_gmail_recipient(self, to_email: str) -> bool:
-        """Fill To fully, pick hotline suggestion or Enter, then ready for Send.
-
-        If LKQ Support chip is already in To, skip typing (do not tap yayra).
-        """
+        """Fill To, commit the chip, confirm the address is on screen."""
         to_email = (to_email or REPORT_EMAIL).strip() or REPORT_EMAIL
         blob = self._adb_screen_blob()
         self._dismiss_invalid_email_dialog(blob)
 
         already = self._gmail_to_is_correct_fast(to_email, blob)
         if already and "%40" not in (blob or "").lower():
-            self._step(f"To already has {to_email} — Enter then Send")
+            self._step(f"To already has {to_email} — committing chip")
             self._commit_gmail_to_with_enter()
             return True
 
         self._step(f"Filling To: {to_email}")
         self._focus_gmail_to_field()
-        time.sleep(0.08)
+        time.sleep(0.15)
+        self._clear_gmail_to_field()
         if not self._adb_type_email(to_email):
             self._commit_gmail_to_with_enter()
             return False
 
-        time.sleep(0.35)
-        # Tap Hotline.support@… suggestion if it appeared; never yayra
+        time.sleep(0.45)
         if not self._tap_correct_gmail_suggestion(to_email):
             self._commit_gmail_to_with_enter()
         else:
-            time.sleep(0.12)
-        return True
+            time.sleep(0.15)
+            self._commit_gmail_to_with_enter()
+        time.sleep(0.35)
+        blob = self._adb_screen_blob()
+        self._dismiss_invalid_email_dialog(blob)
+        if not blob:
+            self._step("UI dump empty after To fill — will try Send anyway")
+            return True
+        ok = self._gmail_to_is_correct_fast(to_email, blob)
+        if ok:
+            self._step(f"To confirmed: {to_email}")
+        else:
+            self._step(f"To not confirmed after typing {to_email}")
+        return ok
 
     def _tap_gmail_send(self) -> None:
-        """Tap the blue Send triangle top-right (circled) — not paperclip, not ⋮."""
+        """Tap the Send paper-plane in the top action bar — not paperclip, not ⋮."""
         w, h = self._window_size()
-        # Prefer accessibility Send in the top action bar
+        tapped = False
         try:
             for el in adb.get_ui_elements(self.serial):
-                desc = (el.get("content_desc") or el.get("text") or "").strip().lower()
+                desc = (el.get("content_desc") or "").strip().lower()
+                text = (el.get("text") or "").strip().lower()
                 rid = (el.get("resource_id") or "").lower()
-                if desc not in {"send", "send email"} and not rid.endswith("/send"):
+                hay = f"{desc} {text} {rid}"
+                if "send" not in hay:
+                    continue
+                if any(bad in hay for bad in ("sender", "resend", "sending", "newsletter")):
                     continue
                 match = re.search(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", el.get("bounds") or "")
                 if not match:
                     continue
                 l, t, r, b = (int(match.group(i)) for i in range(1, 5))
                 x, y = (l + r) // 2, (t + b) // 2
-                if y > int(h * 0.16):
+                if y > int(h * 0.22):
                     continue
-                if x < int(w * 0.70) or x > int(w * 0.96):
+                if x < int(w * 0.58):
                     continue
                 self._adb_tap(x, y)
-                self._step(f"Tapped Gmail Send (blue arrow) at ({x},{y})")
-                return
+                self._step(f"Tapped Gmail Send at ({x},{y})")
+                tapped = True
+                break
         except Exception:
             pass
-
-        # Layout: paperclip ~0.82, Send ~0.89, ⋮ ~0.95
-        x, y = int(w * POINT_GMAIL_SEND[0]), int(h * POINT_GMAIL_SEND[1])
-        self._adb_tap(x, y)
-        self._step(f"Tapped Gmail Send (layout blue arrow) at ({x},{y})")
-        time.sleep(0.12)
-        # Nudge slightly if still on compose
-        x2, y2 = int(w * 0.91), int(h * 0.055)
-        if (x2, y2) != (x, y):
-            self._adb_tap(x2, y2)
+        if not tapped:
+            x, y = int(w * POINT_GMAIL_SEND[0]), int(h * POINT_GMAIL_SEND[1])
+            self._adb_tap(x, y)
+            self._step(f"Tapped Gmail Send (layout) at ({x},{y})")
+            time.sleep(0.15)
+            self._adb_tap(int(w * 0.91), int(h * 0.055))
+            self._adb_tap(int(w * 0.86), int(h * 0.06))
+        time.sleep(0.35)
 
     def handle_common_dialogs(self, max_rounds: int = 4) -> List[str]:
         """Dismiss VAG Diagnostic Firewall first, then generic Launch popups."""
@@ -2965,54 +3364,98 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
         self._step(f"Tapped Intelligent Diagnose (ADB) at ({x},{y})", 0.4)
         return result
 
+    def _blob_is_local_diagnose(self, blob: str) -> bool:
+        """True for the Local Diagnose brand-search page — not the home tile."""
+        low = (blob or "").lower()
+        if not low:
+            return False
+        if "autodetect result" in low or "auto detect result" in low:
+            return False
+        if "enter the model" in low or "please enter the model" in low:
+            return True
+        if "enter the vehicle" in low or "vinscan" in low:
+            return True
+        # Home grid shows both Intelligent Diagnose + Local Diagnose tiles.
+        if "intelligent diagnose" in low:
+            return False
+        has_region = any(tab in low for tab in ("europe", "asia", "america", "china"))
+        has_brand = any(
+            name in low
+            for name in ("volkswagen", "renault", "audi", "toyota", "ford", "bmw", "fiat")
+        )
+        if has_region and has_brand:
+            return True
+        if "passenger car" in low and has_brand:
+            return True
+        return False
+
     def is_local_diagnose_page(self) -> bool:
         """True when Local Diagnose brand grid / search is visible (not home tile)."""
-        if self._u2_has_text("Enter the model name", "VINScan Service", timeout=0.2):
-            return True
-        if self._u2_has_text("Enter the model name", timeout=0.12):
-            return True
         try:
             blob = " ".join(self._adb_ui_texts()).lower()
         except Exception:
             blob = ""
-        if not blob:
-            return False
-        if "enter the model name" in blob:
+        if blob and self._blob_is_local_diagnose(blob):
             return True
-        if "vinscan" in blob and ("brand" in blob or "europe" in blob or "asia" in blob):
+        if self._u2_has_text("Enter the model name", timeout=0.08):
             return True
-        # Brand grid without placeholder (some builds)
-        if "local diagnose" not in blob and "intelligent diagnose" not in blob:
-            if any(b.lower() in blob for b in ("renault", "volkswagen", "vw", "audi", "fiat")):
-                if "europe" in blob or "asia" in blob or "brand" in blob:
-                    return True
+        if self._u2_has_text("VINScan Service", timeout=0.06):
+            return True
         return False
 
-    def ensure_local_diagnose(self) -> bool:
-        """Open Local Diagnose from home if needed (AutoDetect fallback for any brand)."""
-        if self.is_local_diagnose_page():
+    def is_eurolink_home_grid(self) -> bool:
+        """True only on the home tile grid (Intelligent Diagnose + Local Diagnose)."""
+        try:
+            blob = " ".join(self._adb_ui_texts()).lower()
+        except Exception:
+            blob = ""
+        if self._blob_is_local_diagnose(blob):
+            return False
+        if "intelligent diagnose" in blob and (
+            "local diagnose" in blob or "service function" in blob
+        ):
             return True
-        self._step("AutoDetect not available — opening Local Diagnose", 0.2)
-        # Leave AutoDetect / VCI / stuck screens if needed (ADB Back — no u2)
-        self.press_android_back()
-        time.sleep(0.4)
+        return False
+
+    def wait_for_local_diagnose(self, timeout: float = 20.0) -> bool:
+        """After AutoDetect fails the tablet opens Local Diagnose itself — wait, do not go home."""
         if self.is_local_diagnose_page():
+            self._step("Already on Local Diagnose — continuing from here", 0.22)
             return True
-        if not self.open_local_diagnose():
-            try:
-                self.ensure_eurolink_home(max_wait=8.0)
-            except Exception:
-                pass
-            if not self.open_local_diagnose():
-                return False
-        deadline = time.time() + 12.0
+        self._step(
+            "AutoDetect not shown — waiting for Local Diagnose (tablet opens it automatically)",
+            0.2,
+        )
+        deadline = time.time() + timeout
+        last_hb = 0.0
         while time.time() < deadline:
             self.raise_if_cancelled()
             if self.is_local_diagnose_page():
-                self._step("Local Diagnose ready", 0.22)
+                self._step("Local Diagnose is on screen — continuing (no home tap)", 0.22)
                 return True
-            time.sleep(0.35)
+            now = time.time()
+            if now - last_hb >= 4:
+                self._step(
+                    f"Waiting for Local Diagnose… {int(deadline - now)}s left",
+                    0.21,
+                )
+                last_hb = now
+            time.sleep(0.25)
         return self.is_local_diagnose_page()
+
+    def ensure_local_diagnose(self) -> bool:
+        """Stay on Local Diagnose when AutoDetect is skipped. Do not re-select it on home."""
+        if self.wait_for_local_diagnose(timeout=18.0):
+            return True
+        if self.is_eurolink_home_grid():
+            self._step("Still on EURO LINK home — tapping Local Diagnose tile", 0.2)
+            return self.open_local_diagnose()
+        # Dump often misses the page while it is already open — search on this screen.
+        self._step(
+            "Local Diagnose not confirmed in UI dump — continuing brand search on current screen",
+            0.22,
+        )
+        return True
 
     def brand_search_terms(self, brand: Optional[str] = None) -> Sequence[str]:
         """Return Local Diagnose search/tile labels for the chosen brand."""
@@ -3276,9 +3719,14 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
         return result
 
     def continue_after_local_brand(self, timeout: Optional[float] = None) -> str:
-        """After brand icon + OK: wait for Diagnostic, topology, or Renault Show Menu."""
+        """After brand icon + OK: wait for Diagnostic, topology, or brand Show Menu."""
         if timeout is None:
-            timeout = 22.0 if has_renault_auto_search(self.preferred_brand) else 3.5
+            if has_renault_auto_search(self.preferred_brand) or has_toyota_auto_search(
+                self.preferred_brand
+            ):
+                timeout = 22.0
+            else:
+                timeout = 3.5
         deadline = time.time() + timeout
         ok_taps = 0
         while time.time() < deadline:
@@ -3288,6 +3736,9 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
             if self.is_renault_show_menu() or self._renault_yes_no_popup():
                 self._step("Renault Show Menu after Local Diagnose brand", 0.5)
                 return "renault_menu"
+            if self.is_toyota_show_menu():
+                self._step("Toyota/Lexus Show Menu after Local Diagnose brand", 0.5)
+                return "toyota_menu"
             if self.autodetect_result_visible():
                 self.tap_diagnostic()
                 return "diagnostic"
@@ -3298,7 +3749,12 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
             if ok_taps < 3 and ("ok" in blob or "continue" in blob):
                 if not any(
                     k in blob
-                    for k in ("automatically search", "system and function", "gmail")
+                    for k in (
+                        "automatically search",
+                        "automatic search",
+                        "system and function",
+                        "gmail",
+                    )
                 ):
                     ok_taps += 1
                     self._step("Tapping OK after Local Diagnose brand", 0.45)
@@ -3318,7 +3774,7 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
         return "wait_topology"
 
     def local_diagnose_brand_fallback(self) -> Dict[str, object]:
-        """Open Local Diagnose if needed, search/select preferred brand, continue."""
+        """Continue from Local Diagnose (tablet opens it after AutoDetect fails)."""
         out: Dict[str, object] = {
             "ok": False,
             "method": "local_diagnose",
@@ -3328,7 +3784,7 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
         try:
             if not self.is_local_diagnose_page():
                 if not self.ensure_local_diagnose():
-                    out["error"] = "Could not open Local Diagnose for brand selection"
+                    out["error"] = "Could not continue on Local Diagnose for brand selection"
                     self._step(out["error"])
                     return out
 
@@ -3345,7 +3801,14 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
             out["ok"] = True
             self.detected_make = str(pick.get("tapped") or self.preferred_brand)
             self._step(f"Local Diagnose brand selected: {self.detected_make}", 0.45)
-            wait = 22.0 if has_renault_auto_search(self.preferred_brand) else 3.5
+            wait = (
+                22.0
+                if (
+                    has_renault_auto_search(self.preferred_brand)
+                    or has_toyota_auto_search(self.preferred_brand)
+                )
+                else 3.5
+            )
             out["next"] = self.continue_after_local_brand(timeout=wait)
             return out
         except Exception as exc:
@@ -3379,7 +3842,7 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
 
         Same process for any brand:
         1. Intelligent Diagnose → wait for AutoDetect Result
-        2. If AutoDetect does not show → Local Diagnose → select brand → continue
+        2. If AutoDetect does not show → stay on Local Diagnose (tablet opens it) → select brand
         3. Diagnostic / Topology scan → report email
         """
         self.logs = []
@@ -3419,6 +3882,13 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
                 self._step(
                     "Workflow: Renault path (Intelligent Diagnose or Local Diagnose search "
                     "→ Automatically Search → YES → YES → tap model → System and Function → "
+                    "High-speed Scan or Smart Detection → report)",
+                    0.03,
+                )
+            elif has_toyota_auto_search(self.preferred_brand):
+                self._step(
+                    "Workflow: Toyota/Lexus path (AutoDetect → Diagnostic → Show Menu → "
+                    "Automatic Search (Europe and Other) → System and Function → "
                     "High-speed Scan or Smart Detection → report)",
                     0.03,
                 )
@@ -3471,7 +3941,7 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
             else:
                 # Any brand: AutoDetect missed → Local Diagnose → select brand → continue
                 self._step(
-                    f"AutoDetect not reached — Local Diagnose fallback for {self.preferred_brand}",
+                    f"AutoDetect not reached — continuing on Local Diagnose for {self.preferred_brand}",
                     0.35,
                 )
                 fb = self.local_diagnose_brand_fallback()
@@ -3521,7 +3991,20 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
                     )
                     return result
 
-            topo_timeout = 45.0
+            if has_toyota_auto_search(self.preferred_brand):
+                self._step(
+                    "Toyota/Lexus — Show Menu → Automatic Search (Europe and Other)",
+                    0.87,
+                )
+                time.sleep(0.5)
+                adv = self.advance_toyota_after_diagnostic(timeout=90)
+                if not adv.get("ok"):
+                    result["error"] = adv.get("error") or (
+                        "Toyota/Lexus Automatic Search failed after Diagnostic"
+                    )
+                    return result
+
+            topo_timeout = 240.0 if has_fca_oil_reset(self.preferred_brand) else 45.0
             topo = self.wait_system_topology(timeout=topo_timeout)
             if not topo.get("ok") and (
                 topo.get("saw_local_diagnose") or self.is_local_diagnose_page()
@@ -3554,6 +4037,17 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
                     if not adv.get("ok"):
                         result["error"] = adv.get("error") or (
                             "Renault Automatically Search / model identification failed"
+                        )
+                        return result
+                if has_toyota_auto_search(self.preferred_brand):
+                    self._step(
+                        "Toyota/Lexus after Local Diagnose — Show Menu → Automatic Search",
+                        0.87,
+                    )
+                    adv = self.advance_toyota_after_diagnostic(timeout=90)
+                    if not adv.get("ok"):
+                        result["error"] = adv.get("error") or (
+                            "Toyota/Lexus Automatic Search failed after Local Diagnose"
                         )
                         return result
                 topo = self.wait_system_topology(timeout=topo_timeout)
@@ -3644,9 +4138,21 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
             mailed = self.send_scan_report_via_gmail()
             result["emailed_to"] = mailed.get("emailed_to") or self.report_email or REPORT_EMAIL
             result["report_emailed"] = bool(mailed.get("ok"))
+            result["returned_to_topology"] = bool(mailed.get("returned_to_topology"))
             result["engineer"] = self.engineer
             if not mailed.get("ok"):
                 result["error"] = mailed.get("error") or "Failed to email X431 report"
+                result["ok"] = True
+                save_report(
+                    self.serial,
+                    "vag_inspection_report_email",
+                    "failed",
+                    f"vin={vin or 'UNKNOWN'}; make={make}; model={model}; "
+                    f"engineer={self.engineer or '—'}; to={result['emailed_to']}; "
+                    f"error={result['error']}",
+                    None,
+                )
+                self._step(f"Scan finished but email not confirmed: {result['error']}", 0.99)
                 return result
 
             save_report(

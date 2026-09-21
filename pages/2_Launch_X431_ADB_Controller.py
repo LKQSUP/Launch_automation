@@ -12,18 +12,23 @@ import time
 import streamlit as st
 
 from modules.adb_controller import (
+    capture_screenshot,
     connect_adb_wifi,
     connection_mode,
     disconnect_adb_wifi,
+    find_and_tap_text,
     get_device_label,
     get_device_wifi_ip,
     hard_reset_x431_session,
+    input_text,
     is_wifi_serial,
+    keyevent,
     launch_x431,
     list_devices,
     set_device_alias,
     switch_usb_to_wifi,
     sync_adb_devices,
+    tap_ratio,
 )
 from modules.brand_catalog import (
     brand_group_names,
@@ -31,6 +36,7 @@ from modules.brand_catalog import (
     has_fca_oil_reset,
     has_full_workflow,
     has_renault_auto_search,
+    has_toyota_auto_search,
 )
 from modules.db import fetch_vin_audit
 from modules.engineer_session import (
@@ -39,6 +45,7 @@ from modules.engineer_session import (
     resolve_engineer,
 )
 from modules.fca_workflows import FCAWorkflowEngine
+from modules.scrcpy_mirror import mirror_status, start_mirror, stop_mirror
 from modules.vag_workflows import VAGWorkflowEngine
 
 st.set_page_config(page_title="Launch X431 — Auto Detect", layout="wide")
@@ -70,7 +77,7 @@ if devices or "last_adb_devices" not in st.session_state:
 st.subheader("1. Sync tablet")
 c_sync, c_dev = st.columns([1, 3])
 with c_sync:
-    if st.button("Sync ADB", type="primary", width="stretch"):
+    if st.button("Sync ADB", type="primary", use_container_width=True):
         result = sync_adb_devices()
         st.session_state["last_adb_devices"] = result.get("devices") or []
         if result.get("devices"):
@@ -116,10 +123,314 @@ with c_dev:
         st.button(
             "Save label",
             on_click=_save_adb_device_label,
-            width="stretch",
+            use_container_width=True,
         )
         if saved_label := st.session_state.pop("adb_label_just_saved", None):
             st.success(f"Saved label: `{saved_label}`")
+
+# --- Sidebar: live tablet + remote job control -------------------------------
+# Ensure pause event exists early (workers also create it on Start).
+if "autodetect_ctl" not in st.session_state:
+    st.session_state["autodetect_ctl"] = {
+        "running": False,
+        "cancel": threading.Event(),
+        "pause": threading.Event(),
+        "logs": [],
+        "progress": 0.0,
+        "outcome": None,
+        "error": None,
+        "started_at": None,
+        "brand": None,
+        "serial": None,
+        "current_step": None,
+        "step_count": 0,
+        "engineer": None,
+        "report_email": None,
+    }
+elif "pause" not in st.session_state["autodetect_ctl"]:
+    st.session_state["autodetect_ctl"]["pause"] = threading.Event()
+
+_sb_ctl = st.session_state["autodetect_ctl"]
+
+
+def _sidebar_flash(level: str, message: str) -> None:
+    st.session_state["sidebar_ctl_flash"] = (level, message)
+
+
+def _sidebar_do_tap_label(serial_id: str, label: str) -> None:
+    ok = find_and_tap_text(serial_id, label, timeout=4)
+    _sidebar_flash(
+        "success" if ok else "error",
+        f"Tapped «{label}»" if ok else f"«{label}» not found on screen",
+    )
+
+
+with st.sidebar:
+    st.markdown("### Live tablet")
+    st.caption(
+        "Scrcpy = mouse/keyboard control. Buttons below = ADB taps while scripts run. "
+        "**Pause** freezes automation so you can finish the step yourself."
+    )
+    mirror_serial = serial or ""
+    status = mirror_status(mirror_serial)
+    exe_path = str(status.get("scrcpy_path") or "")
+    if status.get("available"):
+        st.success("scrcpy found")
+        if exe_path:
+            st.caption(exe_path if len(exe_path) <= 52 else "…" + exe_path[-48:])
+    else:
+        st.warning("scrcpy not on PATH")
+        st.code("winget install Genymobile.scrcpy", language="bash")
+
+    if status.get("running"):
+        st.info(f"Mirror open · pid {status.get('pid') or '—'}")
+    else:
+        st.caption("Mirror closed")
+
+    sb1, sb2 = st.columns(2)
+    with sb1:
+        open_mirror = st.button(
+            "Open scrcpy",
+            type="primary",
+            use_container_width=True,
+            disabled=not mirror_serial or not status.get("available"),
+            help="Interactive mirror — watch and take over with mouse/keyboard.",
+            key="sb_open_scrcpy",
+        )
+    with sb2:
+        close_mirror = st.button(
+            "Close",
+            use_container_width=True,
+            disabled=not status.get("running"),
+            key="sb_close_scrcpy",
+        )
+
+    wifi_opts = is_wifi_serial(mirror_serial) if mirror_serial else False
+    stay = st.checkbox("Keep tablet awake", value=True, key="scrcpy_stay_awake")
+    low_bw = st.checkbox(
+        "Wi‑Fi / low bandwidth",
+        value=wifi_opts,
+        key="scrcpy_low_bw",
+        help="4M bitrate · max 1024px · 30 fps.",
+    )
+
+    if open_mirror and mirror_serial:
+        kwargs = {
+            "stay_awake": bool(stay),
+            "bitrate": "4M" if low_bw else "8M",
+            "max_size": 1024 if low_bw else 1920,
+            "max_fps": 30 if low_bw else 60,
+        }
+        result = start_mirror(mirror_serial, **kwargs)
+        if result.get("ok"):
+            st.session_state["scrcpy_flash"] = ("success", f"scrcpy opened · pid {result.get('pid')}")
+        else:
+            st.session_state["scrcpy_flash"] = ("error", result.get("error") or "scrcpy failed")
+        st.rerun()
+
+    if close_mirror:
+        stop_mirror(mirror_serial)
+        st.session_state["scrcpy_flash"] = ("success", "scrcpy closed")
+        st.rerun()
+
+    flash_m = st.session_state.pop("scrcpy_flash", None)
+    if flash_m:
+        lvl, msg = flash_m
+        (st.success if lvl == "success" else st.error)(msg)
+
+    # --- Script / job control -----------------------------------------------
+    st.markdown("##### Script control")
+    running = bool(_sb_ctl.get("running"))
+    paused = bool(_sb_ctl.get("pause") and _sb_ctl["pause"].is_set())
+    if running and paused:
+        st.warning("Automation **PAUSED** — tablet is yours")
+    elif running:
+        st.info("Automation running")
+    else:
+        st.caption("No script running")
+
+    jc1, jc2, jc3 = st.columns(3)
+    with jc1:
+        do_pause = st.button(
+            "Pause",
+            use_container_width=True,
+            disabled=not running or paused,
+            key="sb_pause",
+            help="Freeze the script between steps so you can tap manually.",
+        )
+    with jc2:
+        do_resume = st.button(
+            "Resume",
+            use_container_width=True,
+            disabled=not running or not paused,
+            key="sb_resume",
+        )
+    with jc3:
+        do_stop_sb = st.button(
+            "Stop",
+            use_container_width=True,
+            disabled=not running,
+            key="sb_stop",
+            help="Abort the current script (same as main Stop).",
+        )
+
+    if do_pause and _sb_ctl.get("pause") is not None:
+        _sb_ctl["pause"].set()
+        _sb_ctl["phase"] = "Paused — operator control"
+        stamp = time.strftime("%H:%M:%S")
+        _sb_ctl["logs"] = list(_sb_ctl.get("logs") or []) + [
+            {"t": stamp, "msg": "Paused by operator — waiting for Resume"}
+        ]
+        _sb_ctl["current_step"] = "Paused by operator"
+        st.rerun()
+    if do_resume and _sb_ctl.get("pause") is not None:
+        _sb_ctl["pause"].clear()
+        stamp = time.strftime("%H:%M:%S")
+        _sb_ctl["logs"] = list(_sb_ctl.get("logs") or []) + [
+            {"t": stamp, "msg": "Resumed by operator"}
+        ]
+        _sb_ctl["current_step"] = "Resumed by operator"
+        st.rerun()
+    if do_stop_sb:
+        _sb_ctl["cancel"].set()
+        if _sb_ctl.get("pause") is not None:
+            _sb_ctl["pause"].clear()
+        st.warning("Stop requested from sidebar…")
+
+    # --- Remote taps (do the job) -------------------------------------------
+    st.markdown("##### Remote taps")
+    st.caption("Works with or without scrcpy. Prefer **Pause** first if a script is running.")
+    disabled_tap = not mirror_serial
+
+    nav1, nav2, nav3 = st.columns(3)
+    with nav1:
+        if st.button("Back", use_container_width=True, disabled=disabled_tap, key="sb_back"):
+            keyevent(mirror_serial, "KEYCODE_BACK")
+            _sidebar_flash("success", "Back")
+            st.rerun()
+    with nav2:
+        if st.button("Home", use_container_width=True, disabled=disabled_tap, key="sb_home"):
+            keyevent(mirror_serial, "KEYCODE_HOME")
+            _sidebar_flash("success", "Home")
+            st.rerun()
+    with nav3:
+        if st.button("Recents", use_container_width=True, disabled=disabled_tap, key="sb_recents"):
+            keyevent(mirror_serial, "KEYCODE_APP_SWITCH")
+            _sidebar_flash("success", "Recents")
+            st.rerun()
+
+    ok_c1, ok_c2 = st.columns(2)
+    with ok_c1:
+        if st.button("OK", type="primary", use_container_width=True, disabled=disabled_tap, key="sb_ok"):
+            _sidebar_do_tap_label(mirror_serial, "OK")
+            st.rerun()
+    with ok_c2:
+        if st.button("Cancel", use_container_width=True, disabled=disabled_tap, key="sb_cancel"):
+            _sidebar_do_tap_label(mirror_serial, "CANCEL")
+            st.rerun()
+
+    q_labels = [
+        ("Diagnostic", "Diagnostic"),
+        ("Continue", "Continue"),
+        ("Smart Detection", "Smart Detection"),
+        ("Common Special", "Common Special Function"),
+        ("Oil Reset", "Oil Maintenance Reset"),
+        ("Intelligent Diag", "Intelligent Diagnose"),
+    ]
+    qcols = st.columns(2)
+    for i, (btn, label) in enumerate(q_labels):
+        with qcols[i % 2]:
+            if st.button(btn, use_container_width=True, disabled=disabled_tap, key=f"sb_q_{i}"):
+                _sidebar_do_tap_label(mirror_serial, label)
+                st.rerun()
+
+    tap_text = st.text_input(
+        "Tap label on screen",
+        key="sb_custom_tap_text",
+        placeholder="e.g. Oil Maintenance Reset",
+        disabled=disabled_tap,
+    )
+    if st.button("Tap that label", use_container_width=True, disabled=disabled_tap or not (tap_text or "").strip(), key="sb_custom_tap"):
+        _sidebar_do_tap_label(mirror_serial, (tap_text or "").strip())
+        st.rerun()
+
+    with st.expander("Tap by position / type text"):
+        rx = st.slider("X %", 0, 100, 50, key="sb_tap_rx")
+        ry = st.slider("Y %", 0, 100, 50, key="sb_tap_ry")
+        if st.button("Tap position", use_container_width=True, disabled=disabled_tap, key="sb_tap_pct"):
+            msg = tap_ratio(mirror_serial, rx / 100.0, ry / 100.0)
+            _sidebar_flash("success", msg)
+            st.rerun()
+        typed = st.text_input("Type on tablet", key="sb_type_text", disabled=disabled_tap)
+        if st.button("Send text", use_container_width=True, disabled=disabled_tap or not (typed or "").strip(), key="sb_send_text"):
+            try:
+                input_text(mirror_serial, typed or "")
+                _sidebar_flash("success", "Text sent")
+            except Exception as exc:
+                _sidebar_flash("error", str(exc))
+            st.rerun()
+
+    st.markdown("##### App")
+    app1, app2 = st.columns(2)
+    with app1:
+        if st.button("Launch EURO LINK", use_container_width=True, disabled=disabled_tap, key="sb_launch"):
+            try:
+                msg = launch_x431(mirror_serial)
+                _sidebar_flash("success", msg)
+            except Exception as exc:
+                _sidebar_flash("error", str(exc))
+            st.rerun()
+    with app2:
+        if st.button("Hard reset", use_container_width=True, disabled=disabled_tap, key="sb_hard"):
+            _sb_ctl["cancel"].set()
+            if _sb_ctl.get("pause") is not None:
+                _sb_ctl["pause"].clear()
+            reset_result = hard_reset_x431_session(mirror_serial, relaunch=True)
+            _sidebar_flash(
+                "success" if reset_result.get("ok") else "error",
+                "Hard reset done" if reset_result.get("ok") else "Hard reset had errors",
+            )
+            st.rerun()
+
+    flash_sb = st.session_state.pop("sidebar_ctl_flash", None)
+    if flash_sb:
+        lvl, msg = flash_sb
+        (st.success if lvl == "success" else st.error)(msg)
+
+    st.markdown("##### In-app preview")
+    auto_prev = st.checkbox(
+        "Auto-refresh preview",
+        value=False,
+        key="scrcpy_auto_preview",
+        help="Still shots only. Prefer scrcpy for live control.",
+    )
+    refresh_prev = st.button(
+        "Refresh preview",
+        use_container_width=True,
+        disabled=not mirror_serial,
+        key="sb_refresh_prev",
+    )
+    if mirror_serial and (refresh_prev or auto_prev):
+        shot = capture_screenshot(mirror_serial)
+        if shot and shot.exists():
+            st.image(
+                str(shot),
+                caption=f"{get_device_label(mirror_serial)} · {time.strftime('%H:%M:%S')}",
+                use_column_width=True,
+            )
+            if auto_prev:
+                time.sleep(2.5)
+                st.rerun()
+        else:
+            st.caption("Screenshot failed — check ADB.")
+    elif not mirror_serial:
+        st.caption("Sync a device first.")
+
+    st.divider()
+    st.caption(
+        "Tip: **Pause** → open scrcpy / use Remote taps → finish the dialog → **Resume** "
+        "(or **Stop** to abort)."
+    )
 
 # --- 1b) Wi-Fi (same network) -------------------------------------------------
 st.markdown("##### Wi-Fi connection (same network, no USB)")
@@ -153,14 +464,14 @@ with w1:
 with w2:
     do_switch = st.button(
         "Switch USB → Wi-Fi",
-        width="stretch",
+        use_container_width=True,
         disabled=not serial or is_wifi_serial(serial),
         help="Uses the selected USB device: enable TCP/IP, then connect over Wi-Fi.",
     )
 with w3:
-    do_wifi_connect = st.button("Connect Wi-Fi", type="primary", width="stretch")
+    do_wifi_connect = st.button("Connect Wi-Fi", type="primary", use_container_width=True)
 with w4:
-    do_wifi_disconnect = st.button("Disconnect Wi-Fi", width="stretch")
+    do_wifi_disconnect = st.button("Disconnect Wi-Fi", use_container_width=True)
 
 if do_switch and serial:
     with st.spinner("Switching selected USB tablet to Wi-Fi ADB…"):
@@ -263,8 +574,15 @@ if has_full_workflow(brand):
     )
 elif has_renault_auto_search(brand):
     st.success(
-        f"**{brand}** — AutoDetect → Diagnostic, **or Local Diagnose search** if AutoDetect is skipped → "
+        f"**{brand}** — AutoDetect → Diagnostic, **or continue on Local Diagnose** if AutoDetect is skipped "
+        "(tablet opens that page — no home tap) → "
         "**Automatically Search** → YES → YES → tap identified model → System and Function → "
+        "**High-speed Scan** (or **Smart Detection**) → report email."
+    )
+elif has_toyota_auto_search(brand):
+    st.success(
+        f"**{brand}** — AutoDetect → Diagnostic → **Show Menu** → "
+        "**Automatic Search (Europe and Other)** → System and Function / Topology → "
         "**High-speed Scan** (or **Smart Detection**) → report email."
     )
 elif has_fca_oil_reset(brand):
@@ -334,6 +652,7 @@ if "autodetect_ctl" not in st.session_state:
     st.session_state["autodetect_ctl"] = {
         "running": False,
         "cancel": threading.Event(),
+        "pause": threading.Event(),
         "logs": [],  # list of {"t": iso-ish, "msg": str}
         "progress": 0.0,
         "outcome": None,
@@ -346,7 +665,20 @@ if "autodetect_ctl" not in st.session_state:
         "engineer": None,
         "report_email": None,
     }
+if "pause" not in st.session_state["autodetect_ctl"]:
+    st.session_state["autodetect_ctl"]["pause"] = threading.Event()
 ctl = st.session_state["autodetect_ctl"]
+
+
+def _worker_cancel_check(control: dict) -> bool:
+    """True when Stop was requested. While Pause is set, block until Resume/Stop."""
+    pause = control.get("pause")
+    cancel = control.get("cancel")
+    while pause is not None and pause.is_set():
+        if cancel is not None and cancel.is_set():
+            return True
+        time.sleep(0.35)
+    return bool(cancel is not None and cancel.is_set())
 
 
 def _phase_from_step(message: str, progress: float) -> str:
@@ -354,6 +686,8 @@ def _phase_from_step(message: str, progress: float) -> str:
     low = (message or "").lower()
     if "stopped by user" in low or "hard reset" in low:
         return "Stopped / reset"
+    if "paused by operator" in low or low.startswith("paused"):
+        return "Paused — operator control"
     if "preflight" in low or "connecting uiautomator" in low:
         return "1 · Connecting tablet"
     if "home" in low or "euro link" in low and "launch" in low:
@@ -421,24 +755,24 @@ with run_col:
     start = st.button(
         "Start auto detection",
         type="primary",
-        width="stretch",
+        use_container_width=True,
         disabled=bool(ctl.get("running")) or not bool(engineer),
     )
 with stop_col:
     stop = st.button(
         "Stop",
-        width="stretch",
+        use_container_width=True,
         disabled=not bool(ctl.get("running")),
         help="Request cancel of the current auto-detect thread.",
     )
 with reset_col:
     hard_reset = st.button(
         "Hard Reset",
-        width="stretch",
+        use_container_width=True,
         help="Force-stop EURO LINK, clear stuck u2 helpers, relaunch home. Use after Stop or a frozen run.",
     )
 with open_col:
-    if st.button("Only open EURO LINK", width="stretch"):
+    if st.button("Only open EURO LINK", use_container_width=True):
         try:
             st.success(launch_x431(serial))
         except Exception as exc:
@@ -449,17 +783,21 @@ if has_fca_oil_reset(brand):
     start_fca_oil = st.button(
         "Start Oil Maintenance Reset (FCA / SGW)",
         type="primary",
-        width="stretch",
+        use_container_width=True,
         disabled=bool(ctl.get("running")) or not bool(engineer),
         help="Fiat 500e-style: Diagnostic → OK confirm → SGW OK → Common Special Function → Oil reset → home.",
     )
 
 if stop:
     ctl["cancel"].set()
+    if ctl.get("pause") is not None:
+        ctl["pause"].clear()
     st.warning("Stop requested — waiting for the current step to abort…")
 
 if hard_reset:
     ctl["cancel"].set()
+    if ctl.get("pause") is not None:
+        ctl["pause"].clear()
     with st.spinner("Hard reset: force-stop EURO LINK and reopen home…"):
         reset_result = hard_reset_x431_session(serial, relaunch=True)
     stamp = time.strftime("%H:%M:%S")
@@ -478,6 +816,7 @@ if hard_reset:
     ctl["current_step"] = (step_entries[-1]["msg"] if step_entries else "Hard reset")
     ctl["phase"] = "Stopped / reset"
     ctl["cancel"] = threading.Event()  # fresh cancel flag for next run
+    ctl["pause"] = threading.Event()
     if reset_result.get("ok"):
         st.success("Hard reset done — EURO LINK should be on home. You can Start again.")
     else:
@@ -505,7 +844,7 @@ def _run_autodetect_worker(
             control["phase"] = _phase_from_step(message, control["progress"])
 
     def cancel_check() -> bool:
-        return control["cancel"].is_set()
+        return _worker_cancel_check(control)
 
     engine = VAGWorkflowEngine(
         serial_id,
@@ -528,6 +867,16 @@ def _run_autodetect_worker(
         if outcome.get("error") and "Stopped by user" in str(outcome.get("error")):
             control["error"] = "Stopped by user"
             control["phase"] = "Stopped / reset"
+        elif outcome.get("ok") and outcome.get("report_emailed"):
+            control["error"] = None
+            control["progress"] = 1.0
+            control["phase"] = "Done"
+            control["current_step"] = "Report emailed — back on System and Function / Topology"
+        elif outcome.get("ok") and not outcome.get("report_emailed"):
+            control["error"] = outcome.get("error") or "Scan finished but Gmail send was not confirmed"
+            control["progress"] = 1.0
+            control["phase"] = "Scan done — email not confirmed"
+            control["current_step"] = control["error"]
         elif not outcome.get("ok"):
             control["error"] = outcome.get("error") or "Failed"
             control["phase"] = "Failed"
@@ -565,7 +914,7 @@ def _run_fca_oil_worker(
             control["phase"] = _phase_from_step(message, control["progress"])
 
     def cancel_check() -> bool:
-        return control["cancel"].is_set()
+        return _worker_cancel_check(control)
 
     engine = FCAWorkflowEngine(
         serial_id,
@@ -601,6 +950,7 @@ def _run_fca_oil_worker(
 
 if start and not ctl.get("running"):
     ctl["cancel"] = threading.Event()
+    ctl["pause"] = threading.Event()
     ctl["running"] = True
     ctl["logs"] = []
     ctl["progress"] = 0.02
@@ -629,6 +979,7 @@ if start and not ctl.get("running"):
 
 if start_fca_oil and not ctl.get("running"):
     ctl["cancel"] = threading.Event()
+    ctl["pause"] = threading.Event()
     ctl["running"] = True
     ctl["logs"] = []
     ctl["progress"] = 0.02
@@ -675,7 +1026,7 @@ def _run_topology_action_worker(
             control["phase"] = _phase_from_step(message, control["progress"])
 
     def cancel_check() -> bool:
-        return control["cancel"].is_set()
+        return _worker_cancel_check(control)
 
     engine = VAGWorkflowEngine(
         serial_id,
@@ -728,14 +1079,14 @@ act_report, act_clear = st.columns(2)
 with act_report:
     do_report = st.button(
         "Report",
-        width="stretch",
+        use_container_width=True,
         disabled=bool(ctl.get("running")) or not bool(serial) or not bool(engineer),
         help="Must be on System and Function / Topology. Runs Report → email → Back.",
     )
 with act_clear:
     do_clear = st.button(
         "Clear All DTCs",
-        width="stretch",
+        use_container_width=True,
         disabled=bool(ctl.get("running")) or not bool(serial),
         help="Must be on System and Function / Topology. Taps Clear All DTCs bottom-right.",
     )
@@ -743,6 +1094,7 @@ with act_clear:
 
 def _start_topology_action(action: str, label: str) -> None:
     ctl["cancel"] = threading.Event()
+    ctl["pause"] = threading.Event()
     ctl["running"] = True
     ctl["error"] = None
     ctl["progress"] = 0.2
@@ -831,12 +1183,18 @@ if ctl.get("running") or ctl.get("logs") or ctl.get("outcome") is not None or ct
             st.success(
                 f"FCA oil reset complete on `{device_name}` · VIN `{outcome.get('vin') or '—'}` · back on home"
             )
-        else:
+        elif outcome.get("report_emailed"):
             m5.metric("Email", outcome.get("emailed_to") or "—")
             st.success(
                 f"Full scan complete on `{device_name}` · engineer `{outcome.get('engineer') or ctl.get('engineer') or engineer or '—'}` · "
                 f"report emailed to "
                 f"`{outcome.get('emailed_to') or DEFAULT_REPORT_EMAIL}`"
+            )
+        else:
+            m5.metric("Email", "NOT SENT")
+            st.warning(
+                (outcome.get("error") or err or "Scan finished but Gmail send was not confirmed. ")
+                + " The tablet may still be on compose — wait, or tap **Report** to retry."
             )
     elif err and not ctl.get("running"):
         st.error(err)
@@ -849,6 +1207,6 @@ try:
     if audit.empty:
         st.info("No VIN audit rows yet — run auto detection once.")
     else:
-        st.dataframe(audit, width="stretch")
+        st.dataframe(audit, use_container_width=True)
 except Exception as exc:
     st.warning(f"Could not load audit table: {exc}")

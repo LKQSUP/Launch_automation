@@ -45,4 +45,4 @@ history = ticket_history(limit=50)
 if history.empty:
     st.info("No ticket history yet.")
 else:
-    st.dataframe(history, width="stretch")
+    st.dataframe(history, use_container_width=True)

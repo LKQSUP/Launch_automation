@@ -4,7 +4,8 @@ Current path: Oil Maintenance Reset on SGW vehicles (Fiat 500e, 500X, etc.).
 
 Flow:
   Intelligent Diagnose → AutoDetect Result → Diagnostic
-  → Fiat vehicle confirm OK → (SGW unlock OK) → System and Function
+  → Fiat vehicle ID popup OK → Please Wait (reading)
+  → (SGW unlock Success/Fail OK if shown) → System and Function / Topology
   → Common Special Function → Oil Maintenance Reset
   → OK / Continue until "Service Information Have Been Reset" → OK
   → hard reset (force-stop + relaunch EURO LINK home)
@@ -172,15 +173,54 @@ class FCAWorkflowEngine(VAGWorkflowEngine):
         blob = self._fca_adb_ui_blob()
         return "unlocked successfully" in blob or "secure gateway unlocked" in blob
 
-    def _fca_sgw_busy(self) -> bool:
-        """True while SGW unlock is still in progress (no success dialog yet)."""
+    def _fca_sgw_failed_visible(self) -> bool:
+        """True when SGW unlock finished unsuccessfully."""
+        if self._u2_has_text("Unlock Failed", "Unlocked Failed", timeout=0.1):
+            return True
+        if self._u2_has_text("Unlock Unsuccessful", "Failed to Unlock", timeout=0.08):
+            return True
+        blob = self._fca_adb_ui_blob()
+        markers = (
+            "unlock failed",
+            "unlocked failed",
+            "unlock unsuccessful",
+            "failed to unlock",
+            "unable to unlock",
+            "secure gateway unlock failed",
+            "not unlocked",
+        )
+        if any(m in blob for m in markers):
+            return True
+        # Generic failure on an SGW prompt (not still "unlocking…")
+        if "secure gateway" in blob and any(
+            m in blob for m in ("fail", "unsuccess", "error", "unable", "not support")
+        ):
+            if "unlocked successfully" not in blob:
+                return True
+        return False
+
+    def _fca_sgw_result_visible(self) -> Optional[str]:
+        """Return 'success' / 'failed' when SGW finished, else None (still waiting)."""
         if self._fca_sgw_unlocked_visible():
+            return "success"
+        if self._fca_sgw_failed_visible():
+            return "failed"
+        return None
+
+    def _fca_sgw_busy(self) -> bool:
+        """True while SGW unlock is still in progress (no result dialog yet)."""
+        if self._fca_sgw_result_visible():
             return False
         if self._u2_has_text("Secure Gateway", timeout=0.1):
-            # Unlocking / connecting text without success yet.
-            return not self._u2_has_text("Unlocked Successfully", timeout=0.06)
+            return True
         blob = self._fca_adb_ui_blob()
+        # Only treat as SGW busy when Secure Gateway is actually mentioned —
+        # plain "Please Wait…" after Fiat OK is vehicle reading, not SGW.
         if "secure gateway" in blob and "unlocked successfully" not in blob:
+            return True
+        if "connecting to secure gateway" in blob or "sgw unlock" in blob:
+            return True
+        if "unlocking" in blob and "secure" in blob:
             return True
         return False
 
@@ -223,14 +263,19 @@ class FCAWorkflowEngine(VAGWorkflowEngine):
     def _fca_screen_hint(self) -> str:
         """Short label of what is currently on screen (for heartbeat logs)."""
         if self._fca_on_system_function():
-            return "System and Function"
-        if self._fca_sgw_unlocked_visible():
+            return "System and Function / Topology"
+        result = self._fca_sgw_result_visible()
+        if result == "success":
             return "SGW Unlocked Successfully"
+        if result == "failed":
+            return "SGW Unlock Failed"
         if self._fca_fiat_confirm_visible():
-            return "Fiat confirm popup"
+            return "Fiat vehicle ID popup"
         blob = self._fca_adb_ui_blob()
-        if "secure gateway" in blob:
+        if "secure gateway" in blob or ("unlocking" in blob and "secure" in blob):
             return "SGW unlock in progress"
+        if self._fca_is_reading_wait(blob):
+            return "Please Wait / reading"
         if "autodetect result" in blob:
             return "AutoDetect Result"
         if "prompt information" in blob:
@@ -488,7 +533,7 @@ class FCAWorkflowEngine(VAGWorkflowEngine):
             if not detect.get("diagnostic_tapped"):
                 self._fca_tap_diagnostic()
 
-            entered = self._fca_after_diagnostic(timeout=90)
+            entered = self._fca_after_diagnostic(timeout=300)
             if not entered.get("ok"):
                 result["error"] = entered.get("error") or "Did not reach System and Function"
                 return result
@@ -573,20 +618,44 @@ class FCAWorkflowEngine(VAGWorkflowEngine):
         return any(m in low for m in POPUP_MARKERS)
 
     def _fca_on_system_function(self) -> bool:
+        """True on System and Function / Topology (sidebar + Smart Detection footer)."""
         if self._u2_has_text("Common Special Function", timeout=0.08):
             return True
         if self._u2_has_text("System and Function", timeout=0.08):
             return True
+        if self._u2_has_text("System Topology", timeout=0.08):
+            return True
+        if self._u2_has_text("Smart Detection", timeout=0.08):
+            return True
         blob = self._fca_adb_ui_blob()
-        return "common special function" in blob or (
-            "system and function" in blob and "oil maintenance reset" not in blob
-        )
+        if "common special function" in blob:
+            return True
+        if "system and function" in blob:
+            return True
+        if "system topology" in blob and (
+            "smart detection" in blob or "common special" in blob
+        ):
+            return True
+        return False
 
-    def _fca_after_diagnostic(self, timeout: float = 90.0) -> Dict[str, object]:
-        """After Diagnostic: Fiat confirm OK → SGW unlock OK (if shown) → System and Function.
+    def _fca_is_reading_wait(self, blob: str = "") -> bool:
+        """True on 'Please Wait…' reading progress after Fiat OK (no OK button yet)."""
+        low = (blob or self._fca_adb_ui_blob()).lower()
+        if "secure gateway" in low:
+            return False
+        if "please wait" in low:
+            return True
+        if "prompt information" in low and "ok" not in low and "cancel" not in low:
+            return True
+        return False
 
-        Poll the screen — do not sit on a long idle timer. Fiat popup comes first
-        after Diagnostic; OK starts SGW unlock; wait for success prompt if present.
+    def _fca_after_diagnostic(self, timeout: float = 300.0) -> Dict[str, object]:
+        """After Diagnostic:
+
+        1. Wait for Fiat vehicle ID popup → tap OK
+        2. Wait while Please Wait… reading runs
+        3. If SGW appears → wait Success/Fail → OK
+        4. Land on System and Function / Topology → continue oil-reset flow
         """
         out: Dict[str, object] = {
             "ok": False,
@@ -597,28 +666,31 @@ class FCAWorkflowEngine(VAGWorkflowEngine):
             "error": None,
         }
         self._step(
-            "After Diagnostic — watching for Fiat confirm → SGW → System and Function…",
+            "After Diagnostic — wait Fiat ID → OK → reading → Topology "
+            "(or SGW Success/Fail if shown)…",
             0.4,
         )
-        deadline = time.time() + timeout
+        soft_deadline = time.time() + max(90.0, float(timeout))
+        hard_deadline = time.time() + max(360.0, float(timeout) + 60.0)
         last_hb = 0.0
         last_adb = 0.0
         diag_retry = 0
         fiat_confirmed = False
         sgw_ok_tapped = False
+        sgw_started = False
         screen_blob = ""
+        t_start = time.time()
 
-        while time.time() < deadline:
+        while time.time() < min(soft_deadline, hard_deadline):
             self.raise_if_cancelled()
-            remaining = int(deadline - time.time())
+            remaining = int(min(soft_deadline, hard_deadline) - time.time())
             now = time.time()
 
-            # Refresh ADB dump often (u2 exact-match misses 'Model Name:500BEV')
-            if now - last_adb >= 0.8:
+            if now - last_adb >= 0.7:
                 last_adb = now
                 screen_blob = self._fca_adb_ui_blob()
 
-            # 1) Destination
+            # 1) Destination: System and Function / Topology
             if self._fca_on_system_function():
                 texts = self._fca_adb_ui_texts()
                 fields = self._fca_parse_autodetect_fields(texts)
@@ -628,28 +700,53 @@ class FCAWorkflowEngine(VAGWorkflowEngine):
                     out["model"] = fields["model"]
                 if fields.get("make") and not out.get("make"):
                     out["make"] = fields["make"]
-                self._step("System and Function reached", 0.52)
+                path = "Topology (no SGW)" if not out.get("sgw") else "Topology after SGW"
+                self._step(f"System and Function / Topology reached — {path}", 0.52)
                 out["ok"] = True
                 out["make"] = out.get("make") or self.preferred_brand
                 return out
 
-            # 2) SGW unlocked successfully → OK once
+            # 2) SGW finished — Success OR Fail → tap OK once
+            sgw_result = None
             if (
                 "unlocked successfully" in screen_blob
                 or "secure gateway unlocked" in screen_blob
-                or self._fca_sgw_unlocked_visible()
             ):
+                sgw_result = "success"
+            elif any(
+                m in screen_blob
+                for m in (
+                    "unlock failed",
+                    "unlocked failed",
+                    "unlock unsuccessful",
+                    "failed to unlock",
+                    "unable to unlock",
+                )
+            ):
+                sgw_result = "failed"
+            elif "secure gateway" in screen_blob:
+                sgw_result = self._fca_sgw_result_visible()
+
+            if sgw_result:
                 out["sgw"] = True
+                sgw_started = True
+                soft_deadline = max(soft_deadline, time.time() + 90.0)
                 if not sgw_ok_tapped:
-                    self._step("Secure Gateway Unlocked Successfully! — tapping OK", 0.48)
+                    label = (
+                        "Secure Gateway Unlocked Successfully!"
+                        if sgw_result == "success"
+                        else "Secure Gateway Unlock Failed / Unsuccessful"
+                    )
+                    self._step(f"{label} — tapping OK", 0.48)
                     self._fca_tap_confirm_ok()
                     sgw_ok_tapped = True
-                    time.sleep(0.6)
+                    time.sleep(0.7)
+                    last_adb = 0.0
                 else:
                     time.sleep(0.25)
                 continue
 
-            # 3) Fiat confirm popup (first screen after Diagnostic) → OK once
+            # 3) Fiat vehicle ID popup (pic 1) → OK once
             fiat_visible = (
                 self._fca_is_fiat_vehicle_popup(screen_blob)
                 if screen_blob
@@ -665,48 +762,83 @@ class FCAWorkflowEngine(VAGWorkflowEngine):
                 if popup_id.get("make") and not out.get("make"):
                     out["make"] = popup_id["make"]
                 model_label = popup_id.get("model") or popup_id.get("vin") or "vehicle"
-                self._step(f"Fiat vehicle confirm ({model_label}) — tapping OK", 0.42)
+                self._step(f"Fiat vehicle ID ({model_label}) — tapping OK", 0.42)
                 self._fca_tap_confirm_ok()
                 fiat_confirmed = True
-                self._step("Fiat OK — watching for SGW unlock / System and Function…", 0.44)
-                time.sleep(0.6)
-                last_adb = 0.0  # force refresh next loop
+                soft_deadline = max(soft_deadline, time.time() + 180.0)
+                self._step(
+                    "Fiat OK — waiting for reading / Topology "
+                    "(or SGW if this car has Secure Gateway)…",
+                    0.44,
+                )
+                time.sleep(0.55)
+                last_adb = 0.0
                 continue
 
-            # Also catch CANCEL+OK via u2 if ADB blob was empty this cycle
             if (
                 not fiat_confirmed
                 and self._u2_has_text("CANCEL", timeout=0.1)
                 and self._u2_has_text("OK", timeout=0.08)
             ):
-                # Re-check with fresh dump before tapping
                 screen_blob = self._fca_adb_ui_blob()
                 last_adb = now
                 if self._fca_is_fiat_vehicle_popup(screen_blob) or any(
                     m in screen_blob for m in ("model name", "car code", "please record")
                 ):
-                    self._step("Fiat confirm (CANCEL/OK) — tapping OK", 0.42)
+                    self._step("Fiat vehicle ID (CANCEL/OK) — tapping OK", 0.42)
                     self._fca_tap_confirm_ok()
                     fiat_confirmed = True
-                    time.sleep(0.6)
+                    soft_deadline = max(soft_deadline, time.time() + 180.0)
+                    time.sleep(0.55)
                     last_adb = 0.0
                     continue
 
-            # 4) SGW still unlocking — wait for success text (do not spam OK)
-            if "secure gateway" in screen_blob and "unlocked successfully" not in screen_blob:
-                out["sgw"] = True
+            # 4) Please Wait… reading (pic 2) — no SGW yet; do not tap, just wait
+            if fiat_confirmed and self._fca_is_reading_wait(screen_blob):
+                soft_deadline = max(soft_deadline, time.time() + 90.0)
                 if now - last_hb >= 5:
+                    elapsed = int(now - t_start)
                     self._step(
-                        f"SGW unlocking… watching for success prompt ({remaining}s left)",
-                        0.46,
+                        f"Reading vehicle (Please Wait…)… {elapsed}s — "
+                        "next: Topology or SGW",
+                        0.45,
                     )
                     last_hb = now
                 time.sleep(0.35)
                 continue
 
-            # 5) Other Prompt Information + OK (after Fiat already confirmed)
-            if fiat_confirmed and "prompt information" in screen_blob and "ok" in screen_blob:
-                if "secure gateway" in screen_blob and "unlocked successfully" not in screen_blob:
+            # 5) SGW still unlocking — wait for Success/Fail (do not spam OK)
+            sgw_busy = (
+                "secure gateway" in screen_blob
+                and "unlocked successfully" not in screen_blob
+            ) or (
+                fiat_confirmed
+                and not sgw_ok_tapped
+                and self._fca_sgw_busy()
+            )
+            if fiat_confirmed and sgw_busy and not sgw_ok_tapped:
+                out["sgw"] = True
+                sgw_started = True
+                soft_deadline = max(soft_deadline, time.time() + 120.0)
+                if now - last_hb >= 6:
+                    elapsed = int(now - t_start)
+                    self._step(
+                        f"SGW unlocking… waiting for Success/Fail "
+                        f"({elapsed}s elapsed, {remaining}s soft left)",
+                        0.46,
+                    )
+                    last_hb = now
+                time.sleep(0.4)
+                continue
+
+            # 6) Other Prompt Information with OK (after Fiat OK, not reading-only)
+            if (
+                fiat_confirmed
+                and "prompt information" in screen_blob
+                and "ok" in screen_blob
+                and not self._fca_is_reading_wait(screen_blob)
+            ):
+                if sgw_busy and not sgw_ok_tapped:
                     time.sleep(0.35)
                     continue
                 self._step("Prompt Information — tapping OK", 0.45)
@@ -715,7 +847,7 @@ class FCAWorkflowEngine(VAGWorkflowEngine):
                 last_adb = 0.0
                 continue
 
-            # 6) Still on AutoDetect without Fiat modal — retry Diagnostic
+            # 7) Still on AutoDetect without Fiat modal — retry Diagnostic
             if (
                 not fiat_confirmed
                 and diag_retry < 2
@@ -729,8 +861,15 @@ class FCAWorkflowEngine(VAGWorkflowEngine):
                 last_adb = 0.0
                 continue
 
-            if now - last_hb >= 5:
+            if now - last_hb >= 6:
                 hint = self._fca_screen_hint()
+                if "SGW Unlocked" in hint or "SGW Unlock Failed" in hint:
+                    last_adb = 0.0
+                    screen_blob = self._fca_adb_ui_blob()
+                    last_hb = now
+                    continue
+                if "Please Wait" in hint or "reading" in hint.lower():
+                    soft_deadline = max(soft_deadline, time.time() + 60.0)
                 self._step(
                     f"Watching screen ({hint})… {remaining}s left",
                     0.45,
@@ -738,9 +877,17 @@ class FCAWorkflowEngine(VAGWorkflowEngine):
                 last_hb = now
             time.sleep(0.3)
 
-        out["error"] = (
-            "Timed out waiting for System and Function after Diagnostic / SGW unlock"
-        )
+        waited = int(time.time() - t_start)
+        if sgw_started and not sgw_ok_tapped:
+            out["error"] = (
+                f"Timed out waiting for SGW Success/Fail after {waited}s "
+                "(unlock still in progress or result not recognized)"
+            )
+        else:
+            out["error"] = (
+                "Timed out waiting for System and Function / Topology "
+                f"after Fiat ID / reading (waited {waited}s)"
+            )
         self._step(out["error"])
         return out
 
