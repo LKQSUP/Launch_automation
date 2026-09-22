@@ -28,7 +28,20 @@ src/agent/
   local_agent_loop.py    # Perception + recovery + task routing
 ```
 
-## Run
+## Install on a new PC (tablet PC)
+
+On the Windows PC that has the Launch tablet (USB + same network):
+
+1. Download these two files from this repo and keep them in the **same folder**:
+   - [install-on-pc.bat](install-on-pc.bat)
+   - [install-on-pc.ps1](install-on-pc.ps1)
+2. Double-click **`install-on-pc.bat`** (Run as administrator if Git/Python fail to install).
+3. Wait 15–25 minutes. The script installs Git, Python, ADB, the tablet screen viewer, then clones this repo and all Python packages.
+4. Plug in the tablet (USB debugging on). Double-click **Launch X431** on the Desktop.
+
+Later updates on that PC: run `install-on-pc.bat` again, or `git pull` in `Desktop\LKQ_dev\Launch_automation`, then start the app with the Desktop shortcut.
+
+## Run (already installed)
 1. Create and activate a virtual environment
 2. Install dependencies:
 
