@@ -77,7 +77,7 @@ if devices or "last_adb_devices" not in st.session_state:
 st.subheader("1. Sync tablet")
 c_sync, c_dev = st.columns([1, 3])
 with c_sync:
-    if st.button("Sync ADB", type="primary", use_container_width=True):
+    if st.button("Sync ADB", type="primary", width="stretch"):
         result = sync_adb_devices()
         st.session_state["last_adb_devices"] = result.get("devices") or []
         if result.get("devices"):
@@ -123,7 +123,7 @@ with c_dev:
         st.button(
             "Save label",
             on_click=_save_adb_device_label,
-            use_container_width=True,
+            width="stretch",
         )
         if saved_label := st.session_state.pop("adb_label_just_saved", None):
             st.success(f"Saved label: `{saved_label}`")
@@ -166,41 +166,29 @@ def _sidebar_do_tap_label(serial_id: str, label: str) -> None:
 
 
 with st.sidebar:
-    st.markdown("### Live tablet")
-    st.caption(
-        "Scrcpy = mouse/keyboard control. Buttons below = ADB taps while scripts run. "
-        "**Pause** freezes automation so you can finish the step yourself."
-    )
+    st.markdown("### Tablet screen")
+    st.caption("Watch the tablet on your PC, or take over with the mouse.")
     mirror_serial = serial or ""
     status = mirror_status(mirror_serial)
-    exe_path = str(status.get("scrcpy_path") or "")
-    if status.get("available"):
-        st.success("scrcpy found")
-        if exe_path:
-            st.caption(exe_path if len(exe_path) <= 52 else "…" + exe_path[-48:])
-    else:
-        st.warning("scrcpy not on PATH")
-        st.code("winget install Genymobile.scrcpy", language="bash")
-
-    if status.get("running"):
-        st.info(f"Mirror open · pid {status.get('pid') or '—'}")
-    else:
-        st.caption("Mirror closed")
+    if not status.get("available"):
+        st.warning("Live screen isn't available on this PC.")
+    elif status.get("running"):
+        st.success("Screen is open")
 
     sb1, sb2 = st.columns(2)
     with sb1:
         open_mirror = st.button(
-            "Open scrcpy",
+            "Show screen",
             type="primary",
-            use_container_width=True,
+            width="stretch",
             disabled=not mirror_serial or not status.get("available"),
-            help="Interactive mirror — watch and take over with mouse/keyboard.",
+            help="Opens a live window of the tablet.",
             key="sb_open_scrcpy",
         )
     with sb2:
         close_mirror = st.button(
             "Close",
-            use_container_width=True,
+            width="stretch",
             disabled=not status.get("running"),
             key="sb_close_scrcpy",
         )
@@ -208,10 +196,10 @@ with st.sidebar:
     wifi_opts = is_wifi_serial(mirror_serial) if mirror_serial else False
     stay = st.checkbox("Keep tablet awake", value=True, key="scrcpy_stay_awake")
     low_bw = st.checkbox(
-        "Wi‑Fi / low bandwidth",
+        "Use less data (Wi-Fi)",
         value=wifi_opts,
         key="scrcpy_low_bw",
-        help="4M bitrate · max 1024px · 30 fps.",
+        help="Smoother when the tablet is on Wi-Fi rather than USB.",
     )
 
     if open_mirror and mirror_serial:
@@ -223,14 +211,17 @@ with st.sidebar:
         }
         result = start_mirror(mirror_serial, **kwargs)
         if result.get("ok"):
-            st.session_state["scrcpy_flash"] = ("success", f"scrcpy opened · pid {result.get('pid')}")
+            st.session_state["scrcpy_flash"] = ("success", "Tablet screen opened")
         else:
-            st.session_state["scrcpy_flash"] = ("error", result.get("error") or "scrcpy failed")
+            st.session_state["scrcpy_flash"] = (
+                "error",
+                "Could not open the tablet screen",
+            )
         st.rerun()
 
     if close_mirror:
         stop_mirror(mirror_serial)
-        st.session_state["scrcpy_flash"] = ("success", "scrcpy closed")
+        st.session_state["scrcpy_flash"] = ("success", "Tablet screen closed")
         st.rerun()
 
     flash_m = st.session_state.pop("scrcpy_flash", None)
@@ -239,39 +230,39 @@ with st.sidebar:
         (st.success if lvl == "success" else st.error)(msg)
 
     # --- Script / job control -----------------------------------------------
-    st.markdown("##### Script control")
+    st.markdown("##### Scan")
     running = bool(_sb_ctl.get("running"))
     paused = bool(_sb_ctl.get("pause") and _sb_ctl["pause"].is_set())
     if running and paused:
-        st.warning("Automation **PAUSED** — tablet is yours")
+        st.warning("Paused — you can tap the tablet yourself")
     elif running:
-        st.info("Automation running")
+        st.info("Scan running")
     else:
-        st.caption("No script running")
+        st.caption("No scan running")
 
     jc1, jc2, jc3 = st.columns(3)
     with jc1:
         do_pause = st.button(
             "Pause",
-            use_container_width=True,
+            width="stretch",
             disabled=not running or paused,
             key="sb_pause",
-            help="Freeze the script between steps so you can tap manually.",
+            help="Pause the scan so you can tap the tablet yourself.",
         )
     with jc2:
         do_resume = st.button(
             "Resume",
-            use_container_width=True,
+            width="stretch",
             disabled=not running or not paused,
             key="sb_resume",
         )
     with jc3:
         do_stop_sb = st.button(
             "Stop",
-            use_container_width=True,
+            width="stretch",
             disabled=not running,
             key="sb_stop",
-            help="Abort the current script (same as main Stop).",
+            help="Stop the current scan.",
         )
 
     if do_pause and _sb_ctl.get("pause") is not None:
@@ -295,37 +286,37 @@ with st.sidebar:
         _sb_ctl["cancel"].set()
         if _sb_ctl.get("pause") is not None:
             _sb_ctl["pause"].clear()
-        st.warning("Stop requested from sidebar…")
+        st.warning("Stopping the scan…")
 
     # --- Remote taps (do the job) -------------------------------------------
-    st.markdown("##### Remote taps")
-    st.caption("Works with or without scrcpy. Prefer **Pause** first if a script is running.")
+    st.markdown("##### Tap on tablet")
+    st.caption("If a scan is running, pause it first.")
     disabled_tap = not mirror_serial
 
     nav1, nav2, nav3 = st.columns(3)
     with nav1:
-        if st.button("Back", use_container_width=True, disabled=disabled_tap, key="sb_back"):
+        if st.button("Back", width="stretch", disabled=disabled_tap, key="sb_back"):
             keyevent(mirror_serial, "KEYCODE_BACK")
             _sidebar_flash("success", "Back")
             st.rerun()
     with nav2:
-        if st.button("Home", use_container_width=True, disabled=disabled_tap, key="sb_home"):
+        if st.button("Home", width="stretch", disabled=disabled_tap, key="sb_home"):
             keyevent(mirror_serial, "KEYCODE_HOME")
             _sidebar_flash("success", "Home")
             st.rerun()
     with nav3:
-        if st.button("Recents", use_container_width=True, disabled=disabled_tap, key="sb_recents"):
+        if st.button("Recents", width="stretch", disabled=disabled_tap, key="sb_recents"):
             keyevent(mirror_serial, "KEYCODE_APP_SWITCH")
             _sidebar_flash("success", "Recents")
             st.rerun()
 
     ok_c1, ok_c2 = st.columns(2)
     with ok_c1:
-        if st.button("OK", type="primary", use_container_width=True, disabled=disabled_tap, key="sb_ok"):
+        if st.button("OK", type="primary", width="stretch", disabled=disabled_tap, key="sb_ok"):
             _sidebar_do_tap_label(mirror_serial, "OK")
             st.rerun()
     with ok_c2:
-        if st.button("Cancel", use_container_width=True, disabled=disabled_tap, key="sb_cancel"):
+        if st.button("Cancel", width="stretch", disabled=disabled_tap, key="sb_cancel"):
             _sidebar_do_tap_label(mirror_serial, "CANCEL")
             st.rerun()
 
@@ -340,7 +331,7 @@ with st.sidebar:
     qcols = st.columns(2)
     for i, (btn, label) in enumerate(q_labels):
         with qcols[i % 2]:
-            if st.button(btn, use_container_width=True, disabled=disabled_tap, key=f"sb_q_{i}"):
+            if st.button(btn, width="stretch", disabled=disabled_tap, key=f"sb_q_{i}"):
                 _sidebar_do_tap_label(mirror_serial, label)
                 st.rerun()
 
@@ -350,19 +341,19 @@ with st.sidebar:
         placeholder="e.g. Oil Maintenance Reset",
         disabled=disabled_tap,
     )
-    if st.button("Tap that label", use_container_width=True, disabled=disabled_tap or not (tap_text or "").strip(), key="sb_custom_tap"):
+    if st.button("Tap that label", width="stretch", disabled=disabled_tap or not (tap_text or "").strip(), key="sb_custom_tap"):
         _sidebar_do_tap_label(mirror_serial, (tap_text or "").strip())
         st.rerun()
 
     with st.expander("Tap by position / type text"):
         rx = st.slider("X %", 0, 100, 50, key="sb_tap_rx")
         ry = st.slider("Y %", 0, 100, 50, key="sb_tap_ry")
-        if st.button("Tap position", use_container_width=True, disabled=disabled_tap, key="sb_tap_pct"):
+        if st.button("Tap position", width="stretch", disabled=disabled_tap, key="sb_tap_pct"):
             msg = tap_ratio(mirror_serial, rx / 100.0, ry / 100.0)
             _sidebar_flash("success", msg)
             st.rerun()
         typed = st.text_input("Type on tablet", key="sb_type_text", disabled=disabled_tap)
-        if st.button("Send text", use_container_width=True, disabled=disabled_tap or not (typed or "").strip(), key="sb_send_text"):
+        if st.button("Send text", width="stretch", disabled=disabled_tap or not (typed or "").strip(), key="sb_send_text"):
             try:
                 input_text(mirror_serial, typed or "")
                 _sidebar_flash("success", "Text sent")
@@ -373,7 +364,7 @@ with st.sidebar:
     st.markdown("##### App")
     app1, app2 = st.columns(2)
     with app1:
-        if st.button("Launch EURO LINK", use_container_width=True, disabled=disabled_tap, key="sb_launch"):
+        if st.button("Launch EURO LINK", width="stretch", disabled=disabled_tap, key="sb_launch"):
             try:
                 msg = launch_x431(mirror_serial)
                 _sidebar_flash("success", msg)
@@ -381,7 +372,7 @@ with st.sidebar:
                 _sidebar_flash("error", str(exc))
             st.rerun()
     with app2:
-        if st.button("Hard reset", use_container_width=True, disabled=disabled_tap, key="sb_hard"):
+        if st.button("Hard reset", width="stretch", disabled=disabled_tap, key="sb_hard"):
             _sb_ctl["cancel"].set()
             if _sb_ctl.get("pause") is not None:
                 _sb_ctl["pause"].clear()
@@ -397,16 +388,16 @@ with st.sidebar:
         lvl, msg = flash_sb
         (st.success if lvl == "success" else st.error)(msg)
 
-    st.markdown("##### In-app preview")
+    st.markdown("##### Snapshot")
     auto_prev = st.checkbox(
-        "Auto-refresh preview",
+        "Keep updating",
         value=False,
         key="scrcpy_auto_preview",
-        help="Still shots only. Prefer scrcpy for live control.",
+        help="Shows still photos. Use Show screen for a live window.",
     )
     refresh_prev = st.button(
-        "Refresh preview",
-        use_container_width=True,
+        "Take photo",
+        width="stretch",
         disabled=not mirror_serial,
         key="sb_refresh_prev",
     )
@@ -416,21 +407,18 @@ with st.sidebar:
             st.image(
                 str(shot),
                 caption=f"{get_device_label(mirror_serial)} · {time.strftime('%H:%M:%S')}",
-                use_column_width=True,
+                width="stretch",
             )
             if auto_prev:
                 time.sleep(2.5)
                 st.rerun()
         else:
-            st.caption("Screenshot failed — check ADB.")
+            st.caption("Could not take a photo of the tablet.")
     elif not mirror_serial:
-        st.caption("Sync a device first.")
+        st.caption("Connect a tablet first.")
 
     st.divider()
-    st.caption(
-        "Tip: **Pause** → open scrcpy / use Remote taps → finish the dialog → **Resume** "
-        "(or **Stop** to abort)."
-    )
+    st.caption("To take over: **Pause** → tap or use the screen → **Resume**.")
 
 # --- 1b) Wi-Fi (same network) -------------------------------------------------
 st.markdown("##### Wi-Fi connection (same network, no USB)")
@@ -464,14 +452,14 @@ with w1:
 with w2:
     do_switch = st.button(
         "Switch USB → Wi-Fi",
-        use_container_width=True,
+        width="stretch",
         disabled=not serial or is_wifi_serial(serial),
         help="Uses the selected USB device: enable TCP/IP, then connect over Wi-Fi.",
     )
 with w3:
-    do_wifi_connect = st.button("Connect Wi-Fi", type="primary", use_container_width=True)
+    do_wifi_connect = st.button("Connect Wi-Fi", type="primary", width="stretch")
 with w4:
-    do_wifi_disconnect = st.button("Disconnect Wi-Fi", use_container_width=True)
+    do_wifi_disconnect = st.button("Disconnect Wi-Fi", width="stretch")
 
 if do_switch and serial:
     with st.spinner("Switching selected USB tablet to Wi-Fi ADB…"):
@@ -755,24 +743,24 @@ with run_col:
     start = st.button(
         "Start auto detection",
         type="primary",
-        use_container_width=True,
+        width="stretch",
         disabled=bool(ctl.get("running")) or not bool(engineer),
     )
 with stop_col:
     stop = st.button(
         "Stop",
-        use_container_width=True,
+        width="stretch",
         disabled=not bool(ctl.get("running")),
         help="Request cancel of the current auto-detect thread.",
     )
 with reset_col:
     hard_reset = st.button(
         "Hard Reset",
-        use_container_width=True,
+        width="stretch",
         help="Force-stop EURO LINK, clear stuck u2 helpers, relaunch home. Use after Stop or a frozen run.",
     )
 with open_col:
-    if st.button("Only open EURO LINK", use_container_width=True):
+    if st.button("Only open EURO LINK", width="stretch"):
         try:
             st.success(launch_x431(serial))
         except Exception as exc:
@@ -783,7 +771,7 @@ if has_fca_oil_reset(brand):
     start_fca_oil = st.button(
         "Start Oil Maintenance Reset (FCA / SGW)",
         type="primary",
-        use_container_width=True,
+        width="stretch",
         disabled=bool(ctl.get("running")) or not bool(engineer),
         help="Fiat 500e-style: Diagnostic → OK confirm → SGW OK → Common Special Function → Oil reset → home.",
     )
@@ -821,6 +809,8 @@ if hard_reset:
         st.success("Hard reset done — EURO LINK should be on home. You can Start again.")
     else:
         st.error("Hard reset finished with errors — check the step log below.")
+
+
 
 
 def _run_autodetect_worker(
@@ -1079,14 +1069,14 @@ act_report, act_clear = st.columns(2)
 with act_report:
     do_report = st.button(
         "Report",
-        use_container_width=True,
+        width="stretch",
         disabled=bool(ctl.get("running")) or not bool(serial) or not bool(engineer),
         help="Must be on System and Function / Topology. Runs Report → email → Back.",
     )
 with act_clear:
     do_clear = st.button(
         "Clear All DTCs",
-        use_container_width=True,
+        width="stretch",
         disabled=bool(ctl.get("running")) or not bool(serial),
         help="Must be on System and Function / Topology. Taps Clear All DTCs bottom-right.",
     )
@@ -1207,6 +1197,6 @@ try:
     if audit.empty:
         st.info("No VIN audit rows yet — run auto detection once.")
     else:
-        st.dataframe(audit, use_container_width=True)
+        st.dataframe(audit, width="stretch")
 except Exception as exc:
     st.warning(f"Could not load audit table: {exc}")

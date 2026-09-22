@@ -59,7 +59,7 @@ with tab_mgmt:
         else:
             if "id" in df.columns:
                 df = df.sort_values("id", ascending=False)
-            st.dataframe(df.head(limit), use_container_width=True)
+            st.dataframe(df.head(limit), width="stretch")
     except Exception as exc:
         st.error(str(exc))
 
@@ -89,7 +89,7 @@ with tab_audit:
         if audit.empty:
             st.info("No VIN audit rows yet.")
         else:
-            st.dataframe(audit, use_container_width=True)
+            st.dataframe(audit, width="stretch")
     except Exception as exc:
         st.error(str(exc))
 
@@ -100,7 +100,7 @@ with tab_audit:
         if tickets.empty:
             st.info("No tickets yet.")
         else:
-            st.dataframe(tickets, use_container_width=True)
+            st.dataframe(tickets, width="stretch")
     except Exception as exc:
         st.error(str(exc))
 
@@ -111,7 +111,7 @@ with tab_audit:
         if reports.empty:
             st.info("No workflow reports yet.")
         else:
-            st.dataframe(reports, use_container_width=True)
+            st.dataframe(reports, width="stretch")
     except Exception as exc:
         st.error(str(exc))
 
@@ -142,7 +142,7 @@ with tab_debug:
 
     d1, d2, d3 = st.columns([1, 2, 1])
     with d1:
-        if st.button("Sync ADB", use_container_width=True):
+        if st.button("Sync ADB", width="stretch"):
             result = sync_adb_devices()
             st.session_state["last_adb_devices"] = result.get("devices") or []
             if result.get("devices"):
@@ -165,7 +165,7 @@ with tab_debug:
             label = get_device_label(serial)
             st.caption(f"Selected: `{label}`" + (f" · serial `{serial}`" if label != serial else ""))
     with d3:
-        open_ok = st.button("Open EURO LINK", use_container_width=True, disabled=not serial)
+        open_ok = st.button("Open EURO LINK", width="stretch", disabled=not serial)
         if open_ok and serial:
             try:
                 st.success(launch_x431(serial))
@@ -182,7 +182,7 @@ with tab_debug:
             label_visibility="collapsed",
         )
     with aw2:
-        if st.button("Connect Wi-Fi", use_container_width=True):
+        if st.button("Connect Wi-Fi", width="stretch"):
             result = connect_adb_wifi(admin_wifi_host or "")
             st.session_state["last_adb_devices"] = result.get("devices") or list_devices()
             if result.get("ok"):
@@ -194,7 +194,7 @@ with tab_debug:
     if serial:
         st.caption("Mode: " + ("Wi-Fi" if is_wifi_serial(serial) else "USB"))
 
-    run = st.button("Diagnose session", type="primary", disabled=not serial, use_container_width=True)
+    run = st.button("Diagnose session", type="primary", disabled=not serial, width="stretch")
     if run and serial:
         with st.spinner("Capturing session…"):
             diag = diagnose_session(serial)
@@ -228,7 +228,7 @@ with tab_debug:
         with t_left:
             st.markdown("**Screenshot**")
             if shot and Path(shot).exists():
-                st.image(shot, use_column_width=True)
+                st.image(shot, width="stretch")
             else:
                 st.info("No screenshot captured.")
         with t_right:
@@ -242,7 +242,7 @@ with tab_debug:
         st.markdown("### Recent workflow failures / reports")
         fails = diag.get("recent_failures") or []
         if fails:
-            st.dataframe(fails, use_container_width=True)
+            st.dataframe(fails, width="stretch")
         else:
             st.info("No recent report rows.")
 
@@ -250,13 +250,13 @@ with tab_debug:
         with c_a:
             st.markdown("**Recent tickets**")
             if diag.get("recent_tickets"):
-                st.dataframe(diag["recent_tickets"], use_container_width=True)
+                st.dataframe(diag["recent_tickets"], width="stretch")
             else:
                 st.info("None")
         with c_b:
             st.markdown("**Recent VIN audit**")
             if diag.get("recent_audit"):
-                st.dataframe(diag["recent_audit"], use_container_width=True)
+                st.dataframe(diag["recent_audit"], width="stretch")
             else:
                 st.info("None")
 
