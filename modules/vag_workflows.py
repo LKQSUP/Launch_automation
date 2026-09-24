@@ -26,6 +26,7 @@ _U2_RPC = ThreadPoolExecutor(max_workers=2, thread_name_prefix="u2rpc")
 from modules import adb_controller as adb
 from modules.db import ensure_database, save_report, save_vin_audit, save_ticket, set_operator_context
 from modules.engineer_session import DEFAULT_REPORT_EMAIL as REPORT_EMAIL
+from modules.engineer_session import normalize_report_email
 from modules.local_ocr_vision import LocalVisionEngine
 from modules.x431_workflows import (
     HOME_AUTO_DIAGNOSE,
@@ -2686,7 +2687,9 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
         6. Compose → recipient → Send
         7. Back to System and Function / Topology
         """
-        dest = (to_email or getattr(self, "report_email", "") or REPORT_EMAIL).strip() or REPORT_EMAIL
+        dest = normalize_report_email(
+            to_email or getattr(self, "report_email", "") or REPORT_EMAIL
+        )
         out: Dict[str, object] = {
             "ok": False,
             "emailed_to": dest,
@@ -2784,19 +2787,42 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
         to_email = dest
         out["emailed_to"] = to_email
         self._step(f"Step 6b — Fill To: {to_email}", 0.996)
-        filled = self._ensure_gmail_recipient(to_email)
-        if not filled:
-            self._step("To not confirmed — retrying once")
+        filled = False
+        for attempt in range(1, 4):
+            self.raise_if_cancelled()
             filled = self._ensure_gmail_recipient(to_email)
+            blob = self._adb_screen_blob()
+            self._dismiss_invalid_email_dialog(blob)
+            blob = self._adb_screen_blob()
+            if filled and self._gmail_to_is_correct_fast(to_email, blob):
+                self._step(f"To ready ({to_email}) — attempt {attempt}", 0.996)
+                break
+            self._step(f"To not ready — refill attempt {attempt}/3", 0.996)
+            filled = False
+            time.sleep(0.35)
         blob = self._adb_screen_blob()
-        self._dismiss_invalid_email_dialog(blob)
+        if not self._gmail_to_is_correct_fast(to_email, blob):
+            # One last forced refill + suggestion tap before giving up
+            self._step("Final To refill before Send gate", 0.996)
+            self._ensure_gmail_recipient(to_email)
+            blob = self._adb_screen_blob()
+            self._dismiss_invalid_email_dialog(blob)
+            blob = self._adb_screen_blob()
         if blob and not self._gmail_to_is_correct_fast(to_email, blob):
             out["error"] = f"Gmail To field does not show {to_email} — not sending"
             self._step(out["error"])
             return out
 
         self._gmail_dismiss_overlays()
-        if not self._gmail_send_and_confirm(to_email, timeout=24.0):
+        time.sleep(0.25)
+        # Re-check after dismissing keyboard — overlays can hide the chip briefly
+        blob = self._adb_screen_blob()
+        if blob and not self._gmail_to_is_correct_fast(to_email, blob):
+            self._step("To lost after dismiss — refilling once more", 0.996)
+            self._ensure_gmail_recipient(to_email)
+            self._gmail_dismiss_overlays()
+
+        if not self._gmail_send_and_confirm(to_email, timeout=28.0):
             out["error"] = "Gmail Send did not complete — tablet still on compose"
             self._step(out["error"])
             return out
@@ -2925,7 +2951,7 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
         if err:
             self._step(err)
             return {"ok": False, "error": err}
-        dest = (to_email or self.report_email or REPORT_EMAIL).strip() or REPORT_EMAIL
+        dest = normalize_report_email(to_email or self.report_email or REPORT_EMAIL)
         return self.send_scan_report_via_gmail(dest)
 
     def clear_all_dtcs(self) -> Dict[str, object]:
@@ -3008,7 +3034,7 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
             pass
         time.sleep(0.12)
 
-    def _gmail_send_and_confirm(self, to_email: str, timeout: float = 24.0) -> bool:
+    def _gmail_send_and_confirm(self, to_email: str, timeout: float = 28.0) -> bool:
         """Tap Send and wait until compose actually closes. Retry if it stays open."""
         self._step("Tapping Gmail Send — waiting until compose closes", 0.997)
         self._tap_gmail_send()
@@ -3019,8 +3045,10 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
             self.raise_if_cancelled()
             blob = self._adb_screen_blob()
             if self._dismiss_invalid_email_dialog(blob):
+                self._step("Invalid address after Send — refill To then retry Send")
                 self._ensure_gmail_recipient(to_email)
                 self._gmail_dismiss_overlays()
+                time.sleep(0.2)
                 self._tap_gmail_send()
                 send_taps += 1
                 last_tap = time.time()
@@ -3030,13 +3058,16 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
                 self._step("Gmail compose closed — send confirmed", 0.997)
                 return True
             still = self._gmail_compose_visible(blob)
-            if send_taps < 5 and (time.time() - last_tap) >= 1.6 and (still or not blob):
-                self._step(f"Still on compose — Send retry {send_taps + 1}/5")
+            if send_taps < 6 and (time.time() - last_tap) >= 1.8 and (still or not blob):
+                self._step(f"Still on compose — Send retry {send_taps + 1}/6")
+                if blob and not self._gmail_to_is_correct_fast(to_email, blob):
+                    self._ensure_gmail_recipient(to_email)
                 self._gmail_dismiss_overlays()
+                time.sleep(0.15)
                 self._tap_gmail_send()
                 send_taps += 1
                 last_tap = time.time()
-            time.sleep(0.45)
+            time.sleep(0.4)
         blob = self._adb_screen_blob()
         if self._gmail_left_compose(blob):
             self._step("Gmail compose closed — send confirmed", 0.997)
@@ -3061,16 +3092,22 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
         """Cheap To check from one blob (no extra dumps)."""
         want = (to_email or REPORT_EMAIL).strip().lower()
         low = (blob or self._adb_screen_blob()).lower()
+        if not low:
+            return False
         if "%40" in low or "is invalid" in low:
             return False
         if want and want in low:
             return True
+        if "@" in want:
+            local, _, domain = want.partition("@")
+            if local and domain and local in low and domain in low:
+                return True
         if want == REPORT_EMAIL.lower():
             if "hotline.support@lkqbelgium.be" in low:
                 return True
             if "hotline.support" in low and "lkqbelgium" in low:
                 return True
-            if "lkq support" in low:
+            if "lkq support" in low and "yayra" not in low and "diagnostics@" not in low:
                 return True
         return False
 
@@ -3088,12 +3125,58 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
         time.sleep(0.12)
         return True
 
+    def _remove_wrong_gmail_to_chips(self, to_email: str) -> None:
+        """Remove To chips that are not the intended recipient."""
+        want = (to_email or REPORT_EMAIL).strip().lower()
+        local = want.split("@", 1)[0].lower() if want else ""
+        w, h = self._window_size()
+        max_y = int(h * 0.28)
+        try:
+            for el in adb.get_ui_elements(self.serial):
+                raw = (el.get("text") or el.get("content_desc") or "").strip()
+                low = raw.lower()
+                rid = (el.get("resource_id") or "").lower()
+                desc = (el.get("content_desc") or "").lower()
+                match = re.search(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", el.get("bounds") or "")
+                if not match:
+                    continue
+                l, t, r, b = (int(match.group(i)) for i in range(1, 5))
+                y = (t + b) // 2
+                if y > max_y:
+                    continue
+                is_remove = (
+                    "remove" in desc
+                    or "clear" in desc
+                    or "remove" in rid
+                    or low in {"×", "x", "✕"}
+                )
+                if is_remove:
+                    self._adb_tap((l + r) // 2, (t + b) // 2)
+                    time.sleep(0.12)
+                    continue
+                if "@" in low and want not in low:
+                    if local and local in low and "lkqbelgium" in low:
+                        continue
+                    if any(
+                        bad in low
+                        for bad in ("yayra", "osias", "sergoynediag", "diagnostics@")
+                    ):
+                        self._adb_tap((l + r) // 2, (t + b) // 2)
+                        time.sleep(0.08)
+                        try:
+                            self._adb_input("input", "keyevent", "67")
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
     def _tap_correct_gmail_suggestion(self, to_email: str) -> bool:
-        """Tap Suggestions row for hotline only — never yayra / diagnostics / You."""
+        """Tap Suggestions row for the intended address — never yayra / diagnostics / You."""
         want = (to_email or REPORT_EMAIL).strip().lower()
         local = want.split("@", 1)[0].lower()
+        domain = want.split("@", 1)[-1].lower() if "@" in want else ""
         w, h = self._window_size()
-        min_y, max_y = int(h * 0.18), int(h * 0.72)
+        min_y, max_y = int(h * 0.14), int(h * 0.78)
         best: Optional[Tuple[int, int, int, str]] = None
         try:
             for el in adb.get_ui_elements(self.serial):
@@ -3106,10 +3189,8 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
                     for bad in ("yayra", "osias", "sergoynediag", "diagnostics@")
                 ) and want not in low:
                     continue
-                if low in {"you", "suggestions", "to", "from", "lkq support"}:
-                    # Prefer the email line, not the name-only label
-                    if "@" not in low:
-                        continue
+                if low in {"you", "suggestions", "to", "from"}:
+                    continue
                 match = re.search(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", el.get("bounds") or "")
                 if not match:
                     continue
@@ -3122,14 +3203,20 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
                     score = 100
                 elif want == REPORT_EMAIL.lower() and "hotline.support@lkqbelgium.be" in low:
                     score = 100
-                elif want == REPORT_EMAIL.lower() and "hotline.support" in low and "lkqbelgium" in low:
+                elif (
+                    want == REPORT_EMAIL.lower()
+                    and "hotline.support" in low
+                    and "lkqbelgium" in low
+                ):
+                    score = 95
+                elif local and domain and local in low and domain in low:
                     score = 90
-                elif local and local in low and "@" in low and want.split("@")[-1] in low:
-                    score = 80
+                elif want == REPORT_EMAIL.lower() and low == "lkq support":
+                    score = 70
                 else:
                     continue
                 if "@" in low:
-                    score += 10
+                    score += 15
                 if best is None or score > best[0]:
                     best = (score, x, y, raw)
         except Exception:
@@ -3138,8 +3225,8 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
             return False
         _s, x, y, raw = best
         self._adb_tap(x, y)
-        self._step(f"Tapped hotline suggestion: {raw[:70]}")
-        time.sleep(0.12)
+        self._step(f"Tapped To suggestion: {raw[:70]}")
+        time.sleep(0.18)
         return True
 
     def _commit_gmail_to_with_enter(self) -> None:
@@ -3151,20 +3238,19 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
             )
         except Exception:
             pass
-        time.sleep(0.18)
+        time.sleep(0.22)
 
     def _adb_input(self, *parts: str, timeout: int = 4) -> None:
         adb._run_adb(["-s", self.serial, "shell", *parts], timeout=timeout)
 
     def _adb_type_email(self, email: str) -> bool:
-        """Type the full address in segments so ADB does not truncate or print %40.
+        """Type the full address in segments so ADB never prints %40 for @.
 
-        hotline + . + support + @ + lkqbelgium + . + be
+        Example: hotline + . + support + @ + lkqbelgium + . + be
         """
         email = (email or "").strip()
         if not email:
             return False
-        # Split on . and @ so each `input text` is a simple alnum token
         tokens: List[str] = []
         buf = ""
         for ch in email:
@@ -3186,7 +3272,7 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
                     self._adb_input("input", "keyevent", "77")  # KEYCODE_AT
                 else:
                     self._adb_input("input", "text", tok)
-                time.sleep(0.04)
+                time.sleep(0.06)
             self._step(f"Typed To: {email}")
             return True
         except Exception as exc:
@@ -3196,48 +3282,62 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
     def _focus_gmail_to_field(self) -> None:
         """Tap To field — right of the To label (into the value)."""
         w, h = self._window_size()
-        self._adb_tap(int(w * 0.32), int(h * 0.16))
-        time.sleep(0.12)
+        for rx, ry in ((0.42, 0.145), (0.55, 0.16), (0.28, 0.155), (0.50, 0.18)):
+            self._adb_tap(int(w * rx), int(h * ry))
+            time.sleep(0.08)
+        time.sleep(0.1)
 
     def _clear_gmail_to_field(self) -> None:
-        """Clear leftover typed text (keep existing LKQ Support chip if possible)."""
+        """Clear leftover typed text / wrong chips in To."""
         try:
-            # Move to end, delete residual typed chars (not 50 round-trips)
             self._adb_input("input", "keyevent", "KEYCODE_MOVE_END")
-            for _ in range(12):
+            for _ in range(28):
                 self._adb_input("input", "keyevent", "67")  # DEL
+            time.sleep(0.08)
         except Exception:
             pass
 
     def _ensure_gmail_recipient(self, to_email: str) -> bool:
-        """Fill To, commit the chip, confirm the address is on screen."""
+        """Clear To, type address (no %40), pick suggestion, commit chip, confirm."""
         to_email = (to_email or REPORT_EMAIL).strip() or REPORT_EMAIL
         blob = self._adb_screen_blob()
         self._dismiss_invalid_email_dialog(blob)
+        blob = self._adb_screen_blob()
 
         already = self._gmail_to_is_correct_fast(to_email, blob)
-        if already and "%40" not in (blob or "").lower():
+        if (
+            already
+            and "%40" not in (blob or "").lower()
+            and "is invalid" not in (blob or "").lower()
+        ):
             self._step(f"To already has {to_email} — committing chip")
             self._commit_gmail_to_with_enter()
             return True
 
         self._step(f"Filling To: {to_email}")
         self._focus_gmail_to_field()
-        time.sleep(0.15)
+        time.sleep(0.12)
+        self._remove_wrong_gmail_to_chips(to_email)
+        self._focus_gmail_to_field()
         self._clear_gmail_to_field()
         if not self._adb_type_email(to_email):
             self._commit_gmail_to_with_enter()
             return False
 
-        time.sleep(0.45)
-        if not self._tap_correct_gmail_suggestion(to_email):
+        time.sleep(0.55)
+        tapped_sug = self._tap_correct_gmail_suggestion(to_email)
+        if not tapped_sug:
+            time.sleep(0.35)
+            tapped_sug = self._tap_correct_gmail_suggestion(to_email)
+        if not tapped_sug:
             self._commit_gmail_to_with_enter()
         else:
             time.sleep(0.15)
             self._commit_gmail_to_with_enter()
-        time.sleep(0.35)
+        time.sleep(0.4)
         blob = self._adb_screen_blob()
         self._dismiss_invalid_email_dialog(blob)
+        blob = self._adb_screen_blob()
         if not blob:
             self._step("UI dump empty after To fill — will try Send anyway")
             return True
@@ -3252,6 +3352,7 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
         """Tap the Send paper-plane in the top action bar — not paperclip, not ⋮."""
         w, h = self._window_size()
         tapped = False
+        candidates: List[Tuple[int, int, int, str]] = []
         try:
             for el in adb.get_ui_elements(self.serial):
                 desc = (el.get("content_desc") or "").strip().lower()
@@ -3267,27 +3368,42 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
                     continue
                 l, t, r, b = (int(match.group(i)) for i in range(1, 5))
                 x, y = (l + r) // 2, (t + b) // 2
-                if y > int(h * 0.22):
+                if y > int(h * 0.24):
                     continue
-                if x < int(w * 0.58):
+                if x < int(w * 0.55):
                     continue
-                self._adb_tap(x, y)
-                self._step(f"Tapped Gmail Send at ({x},{y})")
-                tapped = True
-                break
+                score = 10
+                if desc == "send" or text == "send":
+                    score = 100
+                elif "send" in desc:
+                    score = 80
+                elif "send" in rid:
+                    score = 60
+                candidates.append((score, x, y, desc or text or rid))
         except Exception:
             pass
-        if not tapped:
-            x, y = int(w * POINT_GMAIL_SEND[0]), int(h * POINT_GMAIL_SEND[1])
+        if candidates:
+            candidates.sort(key=lambda c: (-c[0], -c[1]))
+            _s, x, y, label = candidates[0]
             self._adb_tap(x, y)
-            self._step(f"Tapped Gmail Send (layout) at ({x},{y})")
-            time.sleep(0.15)
-            self._adb_tap(int(w * 0.91), int(h * 0.055))
-            self._adb_tap(int(w * 0.86), int(h * 0.06))
-        time.sleep(0.35)
+            self._step(f"Tapped Gmail Send '{label}' at ({x},{y})")
+            tapped = True
+        if not tapped:
+            for rx, ry in (
+                POINT_GMAIL_SEND,
+                (0.91, 0.055),
+                (0.87, 0.055),
+                (0.93, 0.06),
+                (0.89, 0.07),
+            ):
+                x, y = int(w * rx), int(h * ry)
+                self._adb_tap(x, y)
+                self._step(f"Tapped Gmail Send (layout) at ({x},{y})")
+                time.sleep(0.12)
+        time.sleep(0.4)
 
     def handle_common_dialogs(self, max_rounds: int = 4) -> List[str]:
-        """Dismiss VAG Diagnostic Firewall first, then generic Launch popups."""
+        """Dismiss Diagnostic Firewall, then base popups (incl. Find New Version → UPDATE)."""
         dismissed: List[str] = []
         if self.dismiss_diagnostic_firewall():
             dismissed.append("Diagnostic Firewall OK")
@@ -3300,6 +3416,9 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
 
     def dismiss_until_stable(self, rounds: int = 5) -> None:
         for _ in range(rounds):
+            if self.handle_find_new_version(wait_upgrade=120.0):
+                time.sleep(0.3)
+                continue
             if self.dismiss_diagnostic_firewall():
                 time.sleep(0.35)
                 continue
@@ -3336,6 +3455,8 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
             self.ensure_device()
         except Exception as exc:
             self._step(f"u2 connect skipped: {exc} — continuing with ADB")
+        # Upgrade popup blocks Intelligent Diagnose — handle before any tap.
+        self.handle_find_new_version()
         if self._u2_has_text("Intelligent Diagnose", "AutoDetect Result", timeout=0.12):
             self._step("EURO LINK already open — skipping launch")
             return
@@ -3346,6 +3467,7 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
         except Exception as exc:
             self._step(f"Launch skipped: {exc}")
         time.sleep(0.35)
+        self.handle_find_new_version()
 
     def tap_intelligent_diagnose_fast(self) -> Dict[str, object]:
         """Tap Intelligent Diagnose immediately — one ADB tap, no confirm loops."""

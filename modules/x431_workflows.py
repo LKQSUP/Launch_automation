@@ -236,6 +236,103 @@ class LaunchX431WorkflowEngine:
 
     # --------------------------------------------------------------- public API
 
+    def handle_find_new_version(self, wait_upgrade: float = 600.0) -> bool:
+        """If the home 'Find New Version' popup is shown, tap UPDATE and wait.
+
+        Buttons on that dialog: CANCEL | SKIP THIS VERSION | UPDATE.
+        We always choose UPDATE so the tablet upgrades (e.g. 212MB package).
+        """
+        visible = False
+        try:
+            if self._text_present(("Find New Version",), timeout=0.25):
+                visible = True
+        except Exception:
+            pass
+        if not visible:
+            try:
+                blob = " ".join(
+                    (el.get("text") or "") + " " + (el.get("content_desc") or "")
+                    for el in adb.get_ui_elements(self.serial)
+                ).lower()
+            except Exception:
+                blob = ""
+            if "find new version" in blob or (
+                "upgrade package" in blob and "skip this version" in blob
+            ):
+                visible = True
+        if not visible:
+            return False
+
+        self._step("Find New Version popup — tapping UPDATE", 0.04)
+        tapped = False
+        # Exact label only — never "SKIP THIS VERSION"
+        try:
+            if adb.find_and_tap_text(self.serial, "UPDATE", timeout=3):
+                tapped = True
+                self._step("Tapped UPDATE (ADB text)")
+        except Exception:
+            pass
+        if not tapped:
+            # Rightmost red button on the dialog (typical 1280×800)
+            try:
+                proc = adb._run_adb(
+                    ["-s", self.serial, "shell", "wm", "size"], timeout=4
+                )
+                text = (proc.stdout or "") + (proc.stderr or "")
+                m = re.search(r"(\d+)x(\d+)", text)
+                w, h = (int(m.group(1)), int(m.group(2))) if m else (1280, 800)
+            except Exception:
+                w, h = 1280, 800
+            x, y = int(w * 0.78), int(h * 0.62)
+            try:
+                adb.tap(self.serial, x, y)
+                tapped = True
+                self._step(f"Tapped UPDATE (layout) at ({x},{y})")
+            except Exception as exc:
+                self._step(f"UPDATE tap failed: {exc}")
+                return False
+
+        # Upgrade can take several minutes (hundreds of MB). Wait for home.
+        deadline = time.time() + max(60.0, float(wait_upgrade))
+        last_hb = 0.0
+        self._step("Waiting for tablet upgrade / home after UPDATE…", 0.05)
+        while time.time() < deadline:
+            cancel_fn = getattr(self, "raise_if_cancelled", None)
+            if callable(cancel_fn):
+                cancel_fn()
+            try:
+                blob = " ".join(
+                    (el.get("text") or "") + " " + (el.get("content_desc") or "")
+                    for el in adb.get_ui_elements(self.serial)
+                ).lower()
+            except Exception:
+                blob = ""
+            still_prompt = "find new version" in blob or (
+                "skip this version" in blob and "upgrade package" in blob
+            )
+            on_home = any(
+                t in blob
+                for t in (
+                    "intelligent diagnose",
+                    "intelligent diagnosis",
+                    "service function",
+                    "local diagnose",
+                )
+            )
+            if on_home and not still_prompt:
+                self._step("Upgrade dialog gone — EURO LINK home ready", 0.06)
+                return True
+            now = time.time()
+            if now - last_hb >= 8:
+                left = int(deadline - now)
+                phase = "upgrading" if not still_prompt else "waiting for UPDATE to start"
+                self._step(f"Tablet {phase}… {left}s left", 0.05)
+                last_hb = now
+            time.sleep(1.0)
+
+        self._step("Upgrade wait timed out — continuing (check tablet if still updating)")
+        return True
+
     def handle_common_dialogs(self, max_rounds: int = 4) -> List[str]:
         """Detect and dismiss recurring Launch popups.
 
@@ -243,6 +340,8 @@ class LaunchX431WorkflowEngine:
             Labels that were successfully tapped.
         """
         dismissed: List[str] = []
+        if self.handle_find_new_version():
+            dismissed.append("Find New Version → UPDATE")
         for _ in range(max_rounds):
             hit = self._click_by_text(COMMON_DIALOG_LABELS, timeout=1.5)
             if not hit:
