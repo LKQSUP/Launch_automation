@@ -333,6 +333,79 @@ class LaunchX431WorkflowEngine:
         self._step("Upgrade wait timed out — continuing (check tablet if still updating)")
         return True
 
+    def handle_confirm_vehicle_type(self) -> bool:
+        """If 'Confirm Vehicle Type' is shown, always tap Automotive (never Heavy Duty)."""
+        visible = False
+        try:
+            if self._text_present(("Confirm Vehicle Type",), timeout=0.25):
+                visible = True
+        except Exception:
+            pass
+        blob = ""
+        if not visible:
+            try:
+                blob = " ".join(
+                    (el.get("text") or "") + " " + (el.get("content_desc") or "")
+                    for el in adb.get_ui_elements(self.serial)
+                ).lower()
+            except Exception:
+                blob = ""
+            if "confirm vehicle type" in blob or (
+                "automotive" in blob and "heavy duty" in blob
+            ):
+                visible = True
+        if not visible:
+            return False
+
+        self._step("Confirm Vehicle Type — tapping Automotive", 0.04)
+        tapped = False
+        # Prefer exact Automotive bounds (never Heavy Duty)
+        try:
+            for el in adb.get_ui_elements(self.serial):
+                raw = (el.get("text") or el.get("content_desc") or "").strip()
+                if raw.lower() != "automotive":
+                    continue
+                match = re.search(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", el.get("bounds") or "")
+                if not match:
+                    continue
+                l, t, r, b = (int(match.group(i)) for i in range(1, 5))
+                x, y = (l + r) // 2, (t + b) // 2
+                adb.tap(self.serial, x, y)
+                self._step(f"Tapped Automotive (ADB bounds) at ({x},{y})")
+                tapped = True
+                break
+        except Exception:
+            pass
+        if not tapped:
+            try:
+                if adb.find_and_tap_text(self.serial, "Automotive", timeout=3):
+                    tapped = True
+                    self._step("Tapped Automotive (ADB text)")
+            except Exception:
+                pass
+        if not tapped:
+            try:
+                proc = adb._run_adb(
+                    ["-s", self.serial, "shell", "wm", "size"], timeout=4
+                )
+                text = (proc.stdout or "") + (proc.stderr or "")
+                m = re.search(r"(\d+)x(\d+)", text)
+                w, h = (int(m.group(1)), int(m.group(2))) if m else (1280, 800)
+            except Exception:
+                w, h = 1280, 800
+            # Top red button in the Confirm Vehicle Type dialog
+            x, y = int(w * 0.50), int(h * 0.42)
+            try:
+                adb.tap(self.serial, x, y)
+                tapped = True
+                self._step(f"Tapped Automotive (layout) at ({x},{y})")
+            except Exception as exc:
+                self._step(f"Automotive tap failed: {exc}")
+                return False
+
+        time.sleep(0.45)
+        return True
+
     def handle_common_dialogs(self, max_rounds: int = 4) -> List[str]:
         """Detect and dismiss recurring Launch popups.
 
@@ -342,6 +415,8 @@ class LaunchX431WorkflowEngine:
         dismissed: List[str] = []
         if self.handle_find_new_version():
             dismissed.append("Find New Version → UPDATE")
+        if self.handle_confirm_vehicle_type():
+            dismissed.append("Confirm Vehicle Type → Automotive")
         for _ in range(max_rounds):
             hit = self._click_by_text(COMMON_DIALOG_LABELS, timeout=1.5)
             if not hit:

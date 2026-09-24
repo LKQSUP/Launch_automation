@@ -3419,6 +3419,9 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
             if self.handle_find_new_version(wait_upgrade=120.0):
                 time.sleep(0.3)
                 continue
+            if self.handle_confirm_vehicle_type():
+                time.sleep(0.3)
+                continue
             if self.dismiss_diagnostic_firewall():
                 time.sleep(0.35)
                 continue
@@ -3455,8 +3458,9 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
             self.ensure_device()
         except Exception as exc:
             self._step(f"u2 connect skipped: {exc} — continuing with ADB")
-        # Upgrade popup blocks Intelligent Diagnose — handle before any tap.
+        # Upgrade / vehicle-type popups block Intelligent Diagnose — handle first.
         self.handle_find_new_version()
+        self.handle_confirm_vehicle_type()
         if self._u2_has_text("Intelligent Diagnose", "AutoDetect Result", timeout=0.12):
             self._step("EURO LINK already open — skipping launch")
             return
@@ -3468,6 +3472,7 @@ class VAGWorkflowEngine(LaunchX431WorkflowEngine):
             self._step(f"Launch skipped: {exc}")
         time.sleep(0.35)
         self.handle_find_new_version()
+        self.handle_confirm_vehicle_type()
 
     def tap_intelligent_diagnose_fast(self) -> Dict[str, object]:
         """Tap Intelligent Diagnose immediately — one ADB tap, no confirm loops."""
